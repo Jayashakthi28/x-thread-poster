@@ -1,0 +1,330 @@
+{
+  "_meta": {
+    "target": "https://x.com logged-out public web client",
+    "captured": "2026-11-09",
+    "appVersion": "82d844c4518064e72fb1d8c4bb196fec3571ba4f",
+    "client": "x-web (Vite/React/TanStack), entry-client-logged-out-BgOPDRqa.js",
+    "bundleDir": "/private/var/folders/9z/yv486y_s509gc10_nhhw5p640000gn/T/opencode/x-bundles/js",
+    "reaEvidence": "ev_4d641790b622793bd1ea4ea5e53c4f25964ca7911910e11afc19403b5d88db01",
+    "confidenceLegend": {
+      "OBSERVED": "string/attribute read directly in the served bundle",
+      "INFERRED": "selector follows from an observed route/role/attribute but was not seen in a hydrated logged-in DOM",
+      "LEGACY_UNVERIFIED": "classic responsive-web data-testid; ABSENT from the current x-web bundle, kept only as a fallback"
+    },
+    "warning": "The classic data-testid attributes (tweetTextarea_0, tweetButton, addButton, fileInput, ...) do NOT occur anywhere in the currently served x-web bundle. Prefer the primary selectors; use legacy ones only if the account is served the old responsive-web client.",
+    "selectorSyntax": "Playwright selector strings: CSS by default, with :has-text()/:text-is() used only where visible text is the sole discriminator. Parameterised selectors use <screen_name> or .nth(n) notes."
+  },
+  "selectors": {
+    "composer_root": {
+      "primary": "[role=\"dialog\"]:has([data-modal-slot-surface])",
+      "fallbacks": [
+        "[data-modal-slot-surface]",
+        "[role=\"dialog\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "YPo-umLn.js TweetComposerSlot: `w.Content,{\"data-modal-slot-surface\":``,className:...` with sr-only Title `Create post` / `Edit post`."
+    },
+    "composer_textarea_0": {
+      "primary": "[role=\"dialog\"] textarea[aria-multiline=\"true\"]",
+      "fallbacks": [
+        "textarea[aria-multiline=\"true\"]",
+        "[role=\"dialog\"] textarea",
+        "[data-testid=\"tweetTextarea_0\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "DcNnCk6K.js form-_RszDN-r: `<textarea ... \"aria-label\":T,\"aria-multiline\":`true` ... writingsuggestions:`false``."
+    },
+    "composer_textarea_n": {
+      "primary": "[role=\"dialog\"] textarea[aria-multiline=\"true\"]",
+      "fallbacks": [
+        "[data-testid=\"tweetTextarea_{n}\"]"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "One textarea is rendered per composer item; thread items are appended by the 'Add another post' handler (YPo-umLn.js ro/onAddPost). nth index follows DOM order.",
+      "notes": "Call .nth(n) on the locator; thread items are appended in DOM order."
+    },
+    "composer_post_button": {
+      "primary": "[role=\"dialog\"] button:text-is(\"Post\")",
+      "fallbacks": [
+        "[role=\"dialog\"] button[type=\"submit\"]",
+        "[data-testid=\"tweetButtonInline\"]",
+        "[data-testid=\"tweetButton\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "YPo-umLn.js ao(): `t(r?`Schedule`:n?`Reply`:`Post`)` passed to `<mi.d label={i}>`; form submit handled by form-_RszDN-r onSubmit."
+    },
+    "composer_post_all_button": {
+      "primary": "[role=\"dialog\"] button:text-is(\"Post all\")",
+      "fallbacks": [
+        "[role=\"dialog\"] button:text-is(\"Schedule\")",
+        "[data-testid=\"tweetButton\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "YPo-umLn.js oo(): `s=r(i?`Schedule`:`Post all`)` rendered as variant `primary` with key `post-all`."
+    },
+    "composer_add_post_button": {
+      "primary": "[role=\"dialog\"] button[aria-label=\"Add another post\"]",
+      "fallbacks": [
+        "[role=\"dialog\"] button[aria-label=\"Add Reply\"]",
+        "[data-testid=\"addButton\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "YPo-umLn.js ro(): `d=r(u?`Add Reply`:`Add another post`)`; `<W,{\"aria-label\":d,...onClick:n}>`."
+    },
+    "composer_media_button": {
+      "primary": "[role=\"dialog\"] button[aria-label=\"Add media\"]",
+      "fallbacks": [
+        "[role=\"dialog\"] button:has(svg[data-icon=\"icon-photo-plus\"])"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "DcNnCk6K.js media picker: `<U,{\"aria-label\":o(`Add media`),...}>` plus tooltip content `Add media`."
+    },
+    "composer_media_input": {
+      "primary": "[role=\"dialog\"] input[type=\"file\"]",
+      "fallbacks": [
+        "input[type=\"file\"][multiple]",
+        "input[type=\"file\"][accept*=\"image/jpeg\"]",
+        "[data-testid=\"fileInput\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "DcNnCk6K.js: `<input,{ref:c,accept:wn,\"aria-hidden\":!0,className:`sr-only`,multiple:!0,tabIndex:-1,type:`file`,onChange:m}>`; accept list in CiL7gPmy.js `image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime`."
+    },
+    "composer_media_preview": {
+      "primary": "[role=\"dialog\"] img",
+      "fallbacks": [
+        "[role=\"dialog\"] [data-media-preview]",
+        "[data-testid=\"attachments\"]"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "ComposerTweetMediaPreview is lazy-loaded (YPo-umLn.js `ComposerTweetMediaPreview`); no data-testid/wrapper attribute observed. Preview image is an <img> inside the dialog."
+    },
+    "composer_media_remove_button": {
+      "primary": "[role=\"dialog\"] button[aria-label=\"Remove media\"]",
+      "fallbacks": [
+        "[role=\"dialog\"] button:has-text(\"Remove media\")"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "YPo-umLn.js composer-tweet-media: `c=n(`Remove media`)`; `<W,{\"aria-label\":d,...}>` rendered over the media tile."
+    },
+    "composer_alt_button": {
+      "primary": "[role=\"dialog\"] button[aria-label^=\"Add\"][aria-label*=\"description\"]",
+      "fallbacks": [
+        "[role=\"dialog\"] button[aria-label=\"Add description\"]",
+        "[role=\"dialog\"] button:has-text(\"ALT\")",
+        "[data-testid=\"altTextInput\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "DcNnCk6K.js hc()/vc(): aria-label is `Add {numberOfImages, plural, one {description} other {descriptions}}` or `Image description: {description}`; media viewer badge text `ALT` (Uo7W3OF-.js)."
+    },
+    "composer_alt_text_input": {
+      "primary": "[role=\"dialog\"] textarea[aria-label*=\"description\"]",
+      "fallbacks": [
+        "[role=\"dialog\"] textarea",
+        "[data-testid=\"altTextInput\"]"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "Alt editor is opened via `editMedia(ids,`alt`)` (DcNnCk6K.js hc); the editor chunk was not isolated statically, so the textarea is inferred."
+    },
+    "composer_alt_save_button": {
+      "primary": "[role=\"dialog\"] button:text-is(\"Save\")",
+      "fallbacks": [
+        "[role=\"dialog\"] button:text-is(\"Done\")"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "Alt editor footer is not in the captured chunk; generic confirmation-modal pattern uses text buttons (`Save`/`Discard`/`Cancel`)."
+    },
+    "composer_close_button": {
+      "primary": "[role=\"dialog\"] button[aria-label=\"Close\"]",
+      "fallbacks": [
+        "[role=\"dialog\"] [data-slot=\"dialog-close\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "YPo-umLn.js header: `m=a(`Close`)`; dialog Header renders a close control with that aria-label."
+    },
+    "draft_save_dialog": {
+      "primary": "[role=\"dialog\"]:has-text(\"Save post?\")",
+      "fallbacks": [
+        "[role=\"dialog\"]:has-text(\"Save post?\") button:text-is(\"Save\")",
+        "[data-testid=\"confirmationSheetConfirm\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "YPo-umLn.js Ui(): Title `Save post?`, footer `<W ... >Discard</W>` and `<W ...>Save</W>`; shown when closing a dirty composer."
+    },
+    "draft_save_confirm_button": {
+      "primary": "[role=\"dialog\"]:has-text(\"Save post?\") button:text-is(\"Save\")",
+      "fallbacks": [
+        "[data-testid=\"confirmationSheetConfirm\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "Same Ui() footer: `S=u(`Save`)` passed to the primary button."
+    },
+    "draft_save_cancel_button": {
+      "primary": "[role=\"dialog\"]:has-text(\"Save post?\") button:text-is(\"Discard\")",
+      "fallbacks": [
+        "[role=\"dialog\"]:has-text(\"Save post?\") button:text-is(\"Cancel\")",
+        "[data-testid=\"confirmationSheetCancel\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "Same Ui() footer: `b=u(`Discard`)` secondary button (the actual Cancel is the dialog close path)."
+    },
+    "discard_post_dialog": {
+      "primary": "[role=\"alertdialog\"]:has-text(\"Discard post?\")",
+      "fallbacks": [
+        "[role=\"dialog\"]:has-text(\"Discard post?\")"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "YPo-umLn.js close flow: confirmation-modal with `role:alertdialog`, title `Discard post?`, description `This can't be undone and you'll lose your post.`, confirm `Discard`."
+    },
+    "toast": {
+      "primary": "[data-sonner-toast]",
+      "fallbacks": [
+        "[data-sonner-toaster] [data-sonner-toast]",
+        "[data-testid=\"toast\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "kccSSoK9.js Sonner renderer sets `\"data-sonner-toast\":`` and `\"data-sonner-toaster\"`; composer success text `Your post was sent.` / `Your posts were sent.` (DcNnCk6K.js)."
+    },
+    "toast_view_link": {
+      "primary": "[data-sonner-toast] button:has-text(\"View\")",
+      "fallbacks": [
+        "[data-sonner-toast] a:has-text(\"View\")"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "DcNnCk6K.js send success: `yn(text,{action:{label:c(`View`),onClick(){u.push(i.href)}}})`; Sonner renders the action as a button inside the toast."
+    },
+    "nav_post_button": {
+      "primary": "a[href=\"/compose/post\"]",
+      "fallbacks": [
+        "[data-testid=\"SideNav_NewTweet_Button\"]",
+        "a[href=\"/compose/tweet\"]"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "Route `/compose/post` registered in QM5xmrcI.js; TanStack Link renders href. The classic SideNav_NewTweet_Button string is absent from the bundle."
+    },
+    "nav_profile_link": {
+      "primary": "a[href=\"/<screen_name>\"]",
+      "fallbacks": [
+        "[data-testid=\"AppTabBar_Profile_Link\"]",
+        "[role=\"menu\"] a[href=\"/{screen_name}\"]"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "Profile route is `/{screen_name}`; no AppTabBar_Profile_Link string in the x-web bundle.",
+      "notes": "Substitute the account handle; the href is the profile route."
+    },
+    "account_switcher_button": {
+      "primary": "button[aria-label=\"Account menu\"]",
+      "fallbacks": [
+        "[data-testid=\"SideNav_AccountSwitcher_Button\"]",
+        "button:has-text(\"Account menu\")"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "QM5xmrcI.js account menu: `ue=t(`Account menu`)` used as the trigger aria-label; menu items `Add an existing account`, `Manage accounts`, `Log out @{screenName}`."
+    },
+    "tweet_article": {
+      "primary": "article[itemprop=\"SocialMediaPosting\"]",
+      "fallbacks": [
+        "article[itemType=\"https://schema.org/SocialMediaPosting\"]",
+        "article.group\\/post",
+        "article[data-testid=\"tweet\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "CwBEAaFb.js social-media-posting-T_70vmOa: `<article ... itemProp:c, itemScope:!0, itemType:d>` with default `https://schema.org/SocialMediaPosting`; layout adds class `group/post`."
+    },
+    "tweet_reply_button": {
+      "primary": "article button[aria-label=\"Reply\"]",
+      "fallbacks": [
+        "article [data-testid=\"reply\"]",
+        "button[aria-label=\"Reply\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "CwBEAaFb.js action bar: `A=f(`Reply`)` used for the reply action's aria-label (localized)."
+    },
+    "primary_column": {
+      "primary": "main",
+      "fallbacks": [
+        "[data-testid=\"primaryColumn\"]",
+        "[role=\"main\"]"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "No `primaryColumn` string occurs anywhere in the x-web bundle; the app renders a single <main> region."
+    },
+    "logged_in_indicator": {
+      "primary": "a[href=\"/compose/post\"]",
+      "fallbacks": [
+        "button[aria-label=\"Account menu\"]",
+        "document.cookie contains twid"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "Composer nav route only renders for an authenticated viewer; `twid` is read by the app (Bfx2Rbnk.js `rr=`twid``). auth_token is believed HttpOnly (UNVERIFIED) and is not readable from page JS."
+    },
+    "logged_out_indicator": {
+      "primary": "a[href*=\"/i/jf/onboarding/web\"][href*=\"mode=login\"]",
+      "fallbacks": [
+        "a:has-text(\"Log in\")",
+        "a:has-text(\"Sign up\")"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "Logged-out shell links to `/i/jf/onboarding/web?mode=login&redirect_after_login=%2F` (shell.html); `/i/flow/login` now 302s to that route (beforeLoad in QM5xmrcI.js)."
+    },
+    "login_entry_button": {
+      "primary": "a:has-text(\"Log in with username or email\")",
+      "fallbacks": [
+        "button:has-text(\"Log in with username or email\")",
+        "a[href*=\"mode=login\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "DF3Cg0I9.js: `S=t(`Log in with username or email`)` rendered by component `ye` with `mode:`login``."
+    },
+    "login_username_input": {
+      "primary": "input[autocomplete=\"username\"]",
+      "fallbacks": [
+        "input[name=\"text\"]",
+        "input[type=\"text\"]"
+      ],
+      "confidence": "UNKNOWN",
+      "evidence": "Login form chunk is loaded lazily and was not isolated within the download budget; only the landing button is observed. Legacy X used `input[name=\"text\"]`."
+    },
+    "login_password_input": {
+      "primary": "input[type=\"password\"]",
+      "fallbacks": [
+        "input[name=\"password\"]"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "Standard credential form; password field type is not visible in the captured landing-page chunk."
+    },
+    "login_next_button": {
+      "primary": "[role=\"dialog\"] button:text-is(\"Next\")",
+      "fallbacks": [
+        "button:has-text(\"Next\")"
+      ],
+      "confidence": "UNKNOWN",
+      "evidence": "X login is a multi-step flow; label not found in the captured chunks."
+    },
+    "login_submit_button": {
+      "primary": "button:text-is(\"Log in\")",
+      "fallbacks": [
+        "button[type=\"submit\"]:has-text(\"Log in\")"
+      ],
+      "confidence": "UNKNOWN",
+      "evidence": "Final submit label not found in the captured chunks."
+    },
+    "challenge_dialog": {
+      "primary": "[role=\"dialog\"]:has-text(\"Verify you are a human\")",
+      "fallbacks": [
+        "iframe[src*=\"arkose\"]",
+        "[data-testid=\"arkose\"]"
+      ],
+      "confidence": "OBSERVED",
+      "evidence": "BflhFQAN.js: dialog strings `Verifying you are a human…`, `Verify you are a human`; C3KtfKl5.js `arkose-challenge-6G59uvx3` module builds Arkose iframe keys."
+    },
+    "challenge_iframe": {
+      "primary": "iframe[src*=\"arkose\"]",
+      "fallbacks": [
+        "iframe[title*=\"challenge\"]",
+        "iframe[src*=\"funcaptcha\"]"
+      ],
+      "confidence": "INFERRED",
+      "evidence": "Arkose challenge module (`arkose-challenge-6G59uvx3`) posts messages from an iframe origin; exact origin/src not reconstructed."
+    }
+  }
+}

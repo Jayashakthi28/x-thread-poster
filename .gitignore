@@ -1,0 +1,18 @@
+# Virtualenv and build output
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime state (never commit sessions, cookies or artifacts)
+*.log
+.DS_Store
