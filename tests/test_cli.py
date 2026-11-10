@@ -36,7 +36,15 @@ from xposter import (
     XPosterConfig,
     XPosterError,
 )
-from xposter.diagnose import DomReport, DomRow, DraftsReport, Tell, make_calibration_png
+from xposter.diagnose import (
+    DomReport,
+    DomRow,
+    DraftsReport,
+    ReplyReport,
+    StatusTarget,
+    Tell,
+    make_calibration_png,
+)
 from xposter.ledger import Ledger
 from xposter.pacing import Pacer
 from xposter.sessions import RefreshResult, SessionInfo
@@ -1593,6 +1601,112 @@ def test_doctor_runs_live_checks_only_with_flags(
     assert "DOM calibration" in result.output
     assert "MISSING" in result.output
     assert fake.instances == 0
+
+
+def test_doctor_help_documents_reply_calibration(cli_home: Path, fake: FakeBackend) -> None:
+    result = invoke("doctor", "--help")
+
+    flat = _plain_help(result.output)
+    assert result.exit_code == 0
+    assert "--dom-reply" in flat
+    assert "STATUS_URL" in flat
+    assert "reply composer" in flat.lower()
+    assert "nothing is posted" in flat.lower()
+    assert "--handle" in flat
+
+
+def test_doctor_dom_reply_prints_the_reply_calibration(
+    cli_home: Path, fake: FakeBackend, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.diagnose, "find_chrome", lambda config: "/fake/chrome")
+    monkeypatch.setattr(cli.diagnose, "chrome_version", lambda path: "156.0.0.0")
+    monkeypatch.setattr(cli.diagnose, "resolve_display", lambda config: Display.HEADLESS)
+    seen: dict[str, Any] = {}
+
+    async def fake_reply(config: XPosterConfig, store: Any, status: str, **kw: Any) -> ReplyReport:
+        seen["status"] = status
+        return ReplyReport(
+            target=StatusTarget(
+                tweet_id="111",
+                handle="olsa",
+                url="https://x.com/olsa/status/111",
+                path="/olsa/status/111",
+            ),
+            artifacts=tmp_path / "reply-artifacts",
+            composer_kind="modal",
+            composer_found=True,
+            rows=(
+                DomRow(
+                    "composer_root",
+                    "[role=dialog]",
+                    1,
+                    False,
+                    phase_counts=(0, 1),
+                ),
+            ),
+            submit_control={
+                "text": "Reply",
+                "aria_label": "",
+                "data_testid": "tweetButtonInline",
+                "disabled": False,
+            },
+            submit_enabled_after_typing=True,
+            draftjs=True,
+            report_json=tmp_path / "report.json",
+        )
+
+    monkeypatch.setattr(cli.diagnose, "reply_report", fake_reply)
+
+    result = invoke("--handle", "olsa", "doctor", "--dom-reply", "111")
+
+    assert result.exit_code == 0
+    assert "Reply calibration (live; read-only; nothing is posted):" in result.output
+    assert "composer=modal" in result.output
+    assert "Submit control:" in result.output
+    assert "After typing: submit enabled" in result.output
+    assert "Editor: Draft.js blocks" in result.output
+    assert f"Artifacts: {tmp_path / 'reply-artifacts'}" in result.output
+    assert "Next: compare reply-composer.html" in result.output
+    assert seen["status"] == "111"
+    assert fake.instances == 0
+
+
+def test_doctor_dom_reply_refuses_another_handle_before_the_browser(
+    cli_home: Path, fake: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli.diagnose, "find_chrome", lambda config: "/fake/chrome")
+    monkeypatch.setattr(cli.diagnose, "chrome_version", lambda path: "156.0.0.0")
+    monkeypatch.setattr(cli.diagnose, "resolve_display", lambda config: Display.HEADLESS)
+
+    async def opened_anyway(*args: Any, **kw: Any) -> Any:
+        raise AssertionError("browser opened")
+
+    monkeypatch.setattr(cli.diagnose, "authenticated_page", opened_anyway)
+
+    result = invoke(
+        "--handle",
+        "olsa",
+        "doctor",
+        "--dom-reply",
+        "https://x.com/intruder/status/111",
+    )
+
+    assert result.exit_code == 2
+    assert "only types under your own tweet" in result.output
+    assert "browser opened" not in result.output
+
+
+def test_doctor_dom_reply_requires_a_configured_handle(
+    cli_home: Path, fake: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli.diagnose, "find_chrome", lambda config: "/fake/chrome")
+    monkeypatch.setattr(cli.diagnose, "chrome_version", lambda path: "156.0.0.0")
+    monkeypatch.setattr(cli.diagnose, "resolve_display", lambda config: Display.HEADLESS)
+
+    result = invoke("doctor", "--dom-reply", "111")
+
+    assert result.exit_code == 2
+    assert "set --handle" in result.output
 
 
 def test_doctor_dom_with_media_passes_the_opted_in_flag(

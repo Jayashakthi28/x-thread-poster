@@ -8,16 +8,19 @@ pauses so a scenario takes seconds; no request ever leaves the machine.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -53,9 +56,11 @@ from xposter.media import MAX_IMAGE_BYTES
 from xposter.models import PostedThread, PostedTweet, Thread, Tweet
 from xposter.poster import (
     ClickNotDispatchedError,
+    ResponseTiming,
     XPoster,
     _normalise_editor_text,
     _read_editor_text,
+    _ResponseWatcher,
     _typed_mismatch_summary,
     human_click,
 )
@@ -196,11 +201,165 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def chain_record(index: int, tweet_id: str | None = None) -> PostedTweet:
+    """A caller-owned prefix record with a deliberately unknown URL."""
+    return PostedTweet(
+        index=index,
+        id=tweet_id if tweet_id is not None else str(900_000_000_000_000_000 + index),
+        url="",
+        text_sha256=text_hash(f"tweet {index}"),
+    )
+
+
+def seed_fake_prefix(fake: FakeX, texts: list[str]) -> list[PostedTweet]:
+    """Put an accepted prefix on the fake timeline and return its records.
+
+    ``url`` is left empty on purpose: the poster must rebuild it from the
+    configured handle and the recorded id when the caller's record has none.
+    """
+    prefix: list[PostedTweet] = []
+    parent: str | None = None
+    for index, text in enumerate(texts):
+        tweet_id = str(900_000_000_000_000_000 + index)
+        fake.tweets.append(
+            FakeTweet(
+                id=tweet_id,
+                text=text,
+                author=fake.handle,
+                in_reply_to=parent,
+                media=(),
+            )
+        )
+        prefix.append(
+            PostedTweet(
+                index=index,
+                id=tweet_id,
+                url="",
+                text_sha256=text_hash(text),
+            )
+        )
+        parent = tweet_id
+    return prefix
+
+
 @asynccontextmanager
 async def open_plain_page(config: XPosterConfig) -> AsyncIterator[Page]:
     """A real Chrome page with no fake routes, for DOM-only checks."""
     async with async_playwright() as playwright, open_context(playwright, config) as context:
         yield await new_page(context)
+
+
+_CREATE_TWEET_URL = "https://api.x.com/i/api/graphql/query-id/CreateTweet"
+
+
+def _create_payload(tweet_id: str, *, text: str = "secret tweet text") -> dict[str, Any]:
+    """A CreateTweet body with recognisable content to prove logging never leaks it."""
+    return {
+        "data": {
+            "create_tweet": {
+                "tweet_results": {"rest_id": tweet_id},
+                "note": text,
+            }
+        }
+    }
+
+
+class _StubResponse:
+    """The tiny part of ``playwright.Response`` the watcher needs."""
+
+    def __init__(
+        self,
+        *,
+        body: object = None,
+        status: int = 200,
+        delay_s: float = 0.0,
+        hang: bool = False,
+    ) -> None:
+        self.url = _CREATE_TWEET_URL
+        self.status = status
+        self.request = Mock(resource_type="fetch")
+        self._body = body
+        self._delay_s = delay_s
+        self._hang = hang
+
+    async def json(self) -> object:
+        if self._hang:
+            await asyncio.Event().wait()
+        if self._delay_s:
+            await asyncio.sleep(self._delay_s)
+        return self._body
+
+
+async def test_response_watcher_captures_a_late_body_and_records_timing() -> None:
+    watcher = _ResponseWatcher(Mock())
+    watcher.start()
+    created: list[str] = []
+    watcher.on_created = created.append
+    watcher._on_response(_StubResponse(body=_create_payload("111"), delay_s=0.2))
+
+    await watcher._drain()
+
+    assert created == ["111"]
+    assert len(watcher.timings) == 1
+    timing: ResponseTiming = watcher.timings[0]
+    assert timing.index == 1
+    assert timing.status == 200
+    assert timing.ok is True
+    assert timing.body_done_s > timing.arrived_s
+    assert timing.body_done_s - timing.arrived_s >= 0.15
+
+
+async def test_response_watcher_times_out_a_hung_body_and_keeps_later_responses(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr("xposter.poster._BODY_TIMEOUT_S", 0.05)
+    caplog.set_level(logging.WARNING, logger="xposter.poster")
+    watcher = _ResponseWatcher(Mock())
+    watcher.start()
+    created: list[str] = []
+    watcher.on_created = created.append
+    watcher._on_response(_StubResponse(hang=True))
+    watcher._on_response(_StubResponse(body=_create_payload("222")))
+
+    await watcher._drain()
+
+    assert created == ["222"], "a hung body must not stop the next response"
+    assert [timing.ok for timing in watcher.timings] == [False, True]
+    assert watcher.timings[0].status == 200
+    assert watcher.timings[0].body_done_s >= 0.04
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warnings, "the timeout must be visible in the log"
+    message = warnings[0].getMessage()
+    assert "timed out" in message
+    assert "#1" in message
+
+
+async def test_response_watcher_info_line_has_only_timing_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="xposter.poster")
+    watcher = _ResponseWatcher(Mock())
+    watcher.start()
+    secret_id = "9988776655"
+    secret_text = "DO NOT LOG THIS TEXT"
+    watcher._on_response(_StubResponse(body=_create_payload(secret_id, text=secret_text)))
+
+    await watcher._drain()
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xposter.poster" and record.levelno == logging.INFO
+    ]
+    assert len(lines) == 1
+    line = lines[0]
+    assert re.fullmatch(
+        r"CreateTweet response #1 status=200 arrived=\+\d+\.\d+s body=\+\d+\.\d+s",
+        line,
+    ), line
+    assert secret_id not in line
+    assert secret_text not in line
+    assert _COOKIE_VALUE not in line
 
 
 async def test_composer_posts_a_chain_and_already_posted_stays_offline(
@@ -2197,3 +2356,523 @@ async def test_email_addresses_do_not_count_as_mentions(
     posted = await poster.post_thread(make_thread(text, key="mentions-email"))
 
     assert posted.complete is True
+
+
+async def test_chain_posts_a_fresh_thread_through_the_composer(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-fresh")
+    calls: list[PostedTweet] = []
+    post_all_clicks: list[str] = []
+    original_click = poster._click
+
+    async def count_post_all(page: Page, locator: Locator) -> None:
+        try:
+            label = (await locator.inner_text()).strip()
+        except PlaywrightError:
+            label = ""
+        if label == "Post all":
+            post_all_clicks.append(label)
+        await original_click(page, locator)
+
+    poster._click = count_post_all  # type: ignore[method-assign]
+
+    posted = await poster.post_chain(thread, on_posted=calls.append)
+
+    assert posted.strategy == "composer"
+    assert posted.complete is True
+    assert posted.handle == "olsa_test"
+    assert post_all_clicks == ["Post all"], "one batch click, exactly as post_thread"
+    assert [tweet.index for tweet in posted.tweets] == [0, 1, 2]
+    assert [tweet.id for tweet in posted.tweets] == [tweet.id for tweet in fake.tweets]
+    assert [tweet.url for tweet in posted.tweets] == [
+        f"https://x.com/olsa_test/status/{tweet.id}" for tweet in posted.tweets
+    ]
+    assert [tweet.text_sha256 for tweet in posted.tweets] == [
+        text_hash(text) for text in thread.texts
+    ]
+    assert [tweet.index for tweet in calls] == [0, 1, 2]
+    assert len({tweet.index for tweet in calls}) == 3, "each id is reported once"
+    assert [tweet.id for tweet in calls] == [tweet.id for tweet in fake.tweets]
+    assert [tweet.text for tweet in fake.tweets] == list(thread.texts)
+    assert [
+        request["variables"]["reply"]["in_reply_to_tweet_id"] for request in fake.create_requests
+    ] == [None, fake.tweets[0].id, fake.tweets[1].id]
+
+    entry = poster.ledger.get(thread.content_hash)
+    assert entry is not None
+    assert entry.status is LedgerStatus.POSTED
+    assert entry.strategy == "composer"
+    assert [tweet.id for tweet in entry.posted] == [tweet.id for tweet in fake.tweets]
+    assert entry.completed == posted
+
+
+async def test_chain_uses_the_composer_even_when_config_says_replies(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    config = poster_config.with_overrides(strategy=Strategy.REPLIES)
+    poster = make_poster(config, fake)
+
+    posted = await poster.post_chain(make_thread("One", "Two", key="chain-strategy"))
+
+    assert posted.strategy == "composer"
+    assert posted.complete is True
+    assert len(fake.create_requests) == 2
+    assert fake.create_requests[1]["variables"]["reply"]["in_reply_to_tweet_id"] == (
+        fake.tweets[0].id
+    )
+
+
+async def test_chain_tolerates_a_slow_last_create_tweet_response(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-slow-last")
+    original_create = fake._create_tweet
+    seen = {"count": 0}
+
+    async def slow_last(route: Any, request: Any) -> None:
+        seen["count"] += 1
+        if seen["count"] == 3:
+            await asyncio.sleep(1.5)
+        await original_create(route, request)
+
+    fake._create_tweet = slow_last  # type: ignore[method-assign]
+    calls: list[PostedTweet] = []
+
+    posted = await poster.post_chain(thread, on_posted=calls.append)
+
+    assert posted.complete is True, "a slow body must not turn a success into UNKNOWN"
+    assert seen["count"] == 3
+    assert [tweet.index for tweet in calls] == [0, 1, 2]
+    assert [tweet.id for tweet in calls] == [tweet.id for tweet in fake.tweets]
+    assert len(fake.tweets) == 3
+
+
+async def test_chain_composer_callback_failure_still_records_every_id(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-callback-batch")
+    calls: list[PostedTweet] = []
+    callback_error = RuntimeError("the pipeline could not persist the tweet id")
+
+    def on_posted(tweet: PostedTweet) -> None:
+        calls.append(tweet)
+        raise callback_error
+
+    with pytest.raises(PostOutcomeUnknownError) as excinfo:
+        await poster.post_chain(thread, on_posted=on_posted)
+
+    # The click already dispatched the whole batch, so every id is captured and
+    # recorded even though the callback failed on the first one.
+    assert excinfo.value.__cause__ is callback_error
+    assert [tweet.index for tweet in excinfo.value.posted] == [0, 1, 2]
+    assert [tweet.id for tweet in excinfo.value.posted] == [tweet.id for tweet in fake.tweets]
+    assert [tweet.index for tweet in calls] == [0], "the callback is not called again"
+    assert len(fake.tweets) == 3
+    entry = poster.ledger.get(thread.content_hash)
+    assert entry is not None
+    assert entry.status is LedgerStatus.UNKNOWN
+    assert [tweet.id for tweet in entry.posted] == [tweet.id for tweet in fake.tweets]
+
+
+async def test_chain_composer_fail_at_n_reports_the_captured_prefix(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy", scenario=Scenario.FAIL_AT_N, fail_at=2)
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-fail-at-n")
+    calls: list[PostedTweet] = []
+
+    with pytest.raises(PostOutcomeUnknownError) as excinfo:
+        await poster.post_chain(thread, on_posted=calls.append)
+
+    assert [tweet.index for tweet in calls] == [0]
+    assert [tweet.index for tweet in excinfo.value.posted] == [0]
+    assert [tweet.id for tweet in excinfo.value.posted] == [fake.tweets[0].id]
+    assert "response timings:" in str(excinfo.value)
+    assert [tweet.text for tweet in fake.tweets] == ["Chain one"]
+    entry = poster.ledger.get(thread.content_hash)
+    assert entry is not None
+    assert entry.status is LedgerStatus.UNKNOWN
+    assert [tweet.index for tweet in entry.posted] == [0]
+
+
+async def test_chain_refuses_a_26_tweet_thread_before_the_browser(
+    poster_config: XPosterConfig,
+) -> None:
+    poster = XPoster(poster_config, playwright_factory=forbidden_factory)
+    thread = Thread(tuple(Tweet(f"tweet {index}") for index in range(26)), key="chain-26")
+
+    with pytest.raises(ValidationError, match="at most 25"):
+        await poster.post_chain(thread)
+
+
+async def test_chain_resumes_from_a_caller_owned_prefix(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    prefix = seed_fake_prefix(fake, ["Chain one", "Chain two"])
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-resume")
+    calls: list[PostedTweet] = []
+    typed: list[str] = []
+    original_type = poster._type
+
+    async def record_type(page: Page, text: str) -> None:
+        typed.append(text)
+        await original_type(page, text)
+
+    poster._type = record_type  # type: ignore[method-assign]
+
+    posted = await poster.post_chain(thread, already_posted=prefix, on_posted=calls.append)
+
+    assert posted.strategy == "replies", "the live-unverified resume path must be explicit"
+    assert posted.complete is True
+    assert typed == ["Chain three"], "the recorded prefix must never be retyped"
+    assert len(fake.tweets) == 3
+    assert fake.tweets[2].text == "Chain three"
+    assert fake.tweets[2].in_reply_to == prefix[-1].id
+    assert len(fake.create_requests) == 1
+    request = fake.create_requests[0]["variables"]
+    assert request["tweet_text"] == "Chain three"
+    assert request["reply"]["in_reply_to_tweet_id"] == prefix[-1].id
+    assert any(url.endswith(f"/status/{prefix[-1].id}") for url in fake.visits)
+    assert [tweet.index for tweet in calls] == [2]
+    assert [tweet.id for tweet in posted.tweets] == [
+        prefix[0].id,
+        prefix[1].id,
+        fake.tweets[2].id,
+    ]
+    assert [tweet.url for tweet in posted.tweets] == [
+        f"https://x.com/olsa_test/status/{tweet.id}" for tweet in posted.tweets
+    ]
+
+
+async def test_chain_with_a_complete_prefix_returns_without_a_browser(
+    poster_config: XPosterConfig,
+) -> None:
+    thread = make_thread("Chain one", "Chain two", key="chain-complete-prefix")
+    prefix = seed_fake_prefix(FakeX(dom="legacy"), ["Chain one", "Chain two"])
+    poster = XPoster(poster_config, playwright_factory=forbidden_factory)
+
+    posted = await poster.post_chain(thread, already_posted=prefix)
+
+    assert posted.complete is True
+    assert posted.strategy == "replies"
+    assert [tweet.id for tweet in posted.tweets] == [tweet.id for tweet in prefix]
+    assert [tweet.url for tweet in posted.tweets] == [
+        f"https://x.com/olsa_test/status/{tweet.id}" for tweet in prefix
+    ]
+    assert poster.ledger.get(thread.content_hash) is None
+
+
+async def test_chain_ignores_an_unknown_ledger_entry(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-unknown")
+    poster.ledger.begin(thread.content_hash, strategy="replies", handle="olsa_test", n_tweets=3)
+    poster.ledger.mark_unknown(thread.content_hash, "a previous attempt may have landed")
+
+    posted = await poster.post_chain(thread)
+
+    assert posted.complete is True
+    assert len(fake.tweets) == 3
+    entry = poster.ledger.get(thread.content_hash)
+    assert entry is not None
+    assert entry.status is LedgerStatus.POSTED
+
+
+async def test_chain_ignores_a_posted_ledger_entry_and_keeps_it_as_history(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-posted")
+    previous = PostedThread(
+        thread_hash=thread.content_hash,
+        handle="olsa_test",
+        strategy="replies",
+        posted_at="2026-11-10T00:00:00+00:00",
+        tweets=tuple(chain_record(index) for index in range(3)),
+        complete=True,
+    )
+    poster.ledger.begin(thread.content_hash, strategy="replies", handle="olsa_test", n_tweets=3)
+    poster.ledger.complete(thread.content_hash, previous)
+
+    posted = await poster.post_chain(thread)
+
+    assert posted.complete is True
+    assert len(fake.tweets) == 3
+    entry = poster.ledger.get(thread.content_hash)
+    assert entry is not None
+    assert entry.status is LedgerStatus.POSTED
+    assert entry.previous_completed == previous
+    assert [tweet.id for tweet in entry.posted] == [tweet.id for tweet in fake.tweets]
+    assert all(fresh.id != old.id for old, fresh in zip(previous.tweets, entry.posted, strict=True))
+
+
+async def test_chain_refuses_a_parked_store_before_the_browser(
+    poster_config: XPosterConfig,
+) -> None:
+    poster = XPoster(poster_config, playwright_factory=forbidden_factory)
+    poster.store.park("captcha", kind="challenge")
+
+    with pytest.raises(ParkedError):
+        await poster.post_chain(make_thread("Chain one", key="chain-parked"))
+
+
+async def test_chain_pacing_blocks_before_the_browser(poster_config: XPosterConfig) -> None:
+    poster = XPoster(poster_config, playwright_factory=forbidden_factory)
+    poster.ledger.set_not_before(datetime.now(UTC) + timedelta(hours=1))
+
+    with pytest.raises(PacingError) as excinfo:
+        await poster.post_chain(make_thread("Chain one", "Chain two", key="chain-pacing"))
+
+    assert excinfo.value.retry_after_s > 0
+
+
+async def test_chain_pacing_counts_only_the_remaining_tweets(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    config = poster_config.with_overrides(
+        pacing=replace(poster_config.pacing, max_tweets_per_day=2)
+    )
+    poster = make_poster(config, fake)
+    prefix = seed_fake_prefix(fake, ["Chain one", "Chain two"])
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-remaining")
+
+    # The whole 3-tweet thread cannot fit max_tweets_per_day=2, but the single
+    # remaining tweet can; a total-count check would raise here.
+    posted = await poster.post_chain(thread, already_posted=prefix)
+
+    assert posted.complete is True
+    assert len(fake.tweets) == 3
+
+
+async def test_chain_callback_failure_stops_after_the_accepted_id(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    prefix = seed_fake_prefix(fake, ["Chain one"])
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-callback")
+    calls: list[PostedTweet] = []
+    callback_error = RuntimeError("the pipeline could not persist the tweet id")
+
+    def on_posted(tweet: PostedTweet) -> None:
+        calls.append(tweet)
+        raise callback_error
+
+    with pytest.raises(PostOutcomeUnknownError) as excinfo:
+        await poster.post_chain(thread, already_posted=prefix, on_posted=on_posted)
+
+    assert excinfo.value.__cause__ is callback_error
+    assert [tweet.index for tweet in excinfo.value.posted] == [0, 1]
+    assert [tweet.id for tweet in excinfo.value.posted] == [
+        prefix[0].id,
+        fake.tweets[1].id,
+    ]
+    assert [tweet.index for tweet in calls] == [1]
+    assert [tweet.text for tweet in fake.tweets] == ["Chain one", "Chain two"]
+    assert len(fake.create_requests) == 1
+    entry = poster.ledger.get(thread.content_hash)
+    assert entry is not None
+    assert entry.status is LedgerStatus.UNKNOWN
+    assert [tweet.index for tweet in entry.posted] == [0, 1]
+
+
+async def test_chain_callback_xposter_error_is_re_raised_after_the_batch_settles(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = make_thread("Chain one", "Chain two", key="chain-callback-xposter")
+    sentinel = ValidationError("the caller rejected this id")
+
+    def on_posted(tweet: PostedTweet) -> None:
+        raise sentinel
+
+    with pytest.raises(ValidationError) as excinfo:
+        await poster.post_chain(thread, on_posted=on_posted)
+
+    assert excinfo.value is sentinel
+    assert len(fake.tweets) == 2, "the composer batch still settles"
+    entry = poster.ledger.get(thread.content_hash)
+    assert entry is not None
+    assert entry.status is LedgerStatus.UNKNOWN
+    assert [tweet.id for tweet in entry.posted] == [tweet.id for tweet in fake.tweets]
+
+
+@pytest.mark.parametrize(
+    ("prefix", "match"),
+    [
+        ([chain_record(0), chain_record(2)], "accepted prefix in order"),
+        ([chain_record(1), chain_record(0)], "accepted prefix in order"),
+        ([chain_record(0, "12a")], "ASCII digit strings"),
+        (
+            [chain_record(0), chain_record(1), chain_record(2), chain_record(3)],
+            "cannot be longer than the thread",
+        ),
+    ],
+    ids=["gap", "wrong-order", "non-digit-id", "too-long"],
+)
+async def test_chain_rejects_an_invalid_prefix_before_the_browser(
+    poster_config: XPosterConfig,
+    prefix: list[PostedTweet],
+    match: str,
+) -> None:
+    poster = XPoster(poster_config, playwright_factory=forbidden_factory)
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-invalid")
+
+    with pytest.raises(ValidationError, match=match):
+        await poster.post_chain(thread, already_posted=prefix)
+
+
+async def test_chain_composer_attaches_media_to_each_tweet(
+    poster_config: XPosterConfig, fake_x_factory: Any, tmp_path: Path
+) -> None:
+    root_image = tmp_path / "root.png"
+    reply_image = tmp_path / "reply.png"
+    root_image.write_bytes(_PNG_1X1)
+    reply_image.write_bytes(_PNG_1X1)
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = Thread(
+        (
+            Tweet("Root with an image", media=(root_image,)),
+            Tweet("Reply with an image", media=(reply_image,)),
+            Tweet("Plain reply"),
+        ),
+        key="chain-media",
+    )
+
+    posted = await poster.post_chain(thread)
+
+    assert posted.strategy == "composer"
+    assert posted.complete is True
+    bodies = fake.create_requests
+    assert [len(body["variables"]["media"]["media_entities"]) for body in bodies] == [1, 1, 0]
+    assert [tweet.media for tweet in fake.tweets] == [("root.png",), ("reply.png",), ()]
+
+
+async def test_chain_crash_after_a_click_leaves_the_barrier_up_and_can_be_resumed(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    prefix = seed_fake_prefix(fake, ["Chain one"])
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-crash")
+    original_pause = poster._pause
+    gaps = {"count": 0}
+
+    async def crash_on_second_gap(kind: str) -> None:
+        if kind == "between_tweet":
+            gaps["count"] += 1
+            if gaps["count"] == 2:
+                raise KeyboardInterrupt
+        await original_pause(kind)
+
+    poster._pause = crash_on_second_gap  # type: ignore[method-assign]
+
+    with pytest.raises(KeyboardInterrupt):
+        await poster.post_chain(thread, already_posted=prefix)
+
+    interrupted = poster.ledger.get(thread.content_hash)
+    assert interrupted is not None
+    assert interrupted.status is LedgerStatus.PENDING
+    assert interrupted.clicking_at, "the click barrier must survive the interruption"
+    assert [tweet.index for tweet in interrupted.posted] == [0, 1]
+    assert len(fake.tweets) == 2
+    accepted = tuple(interrupted.posted)
+
+    # The caller owns idempotency: a PENDING entry with a raised barrier must not
+    # block the next chain call, unlike post_thread, which would demand --force.
+    resumed = await make_poster(poster_config, fake).post_chain(thread, already_posted=accepted)
+
+    assert resumed.strategy == "replies"
+    assert resumed.complete is True
+    assert [tweet.index for tweet in resumed.tweets] == [0, 1, 2]
+    assert len(fake.tweets) == 3
+    assert (
+        fake.create_requests[1]["variables"]["reply"]["in_reply_to_tweet_id"]
+        == interrupted.posted[-1].id
+    )
+    assert poster.ledger.get(thread.content_hash).status is LedgerStatus.POSTED
+
+
+async def test_chain_readback_mismatch_keeps_the_prefix_and_posts_nothing_further(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    prefix = seed_fake_prefix(fake, ["Chain one", "Chain two"])
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-readback")
+    original_type = poster._type
+
+    async def type_wrong_text(page: Page, text: str) -> None:
+        await original_type(page, f"{text}!")
+
+    poster._type = type_wrong_text  # type: ignore[method-assign]
+
+    with pytest.raises(UiChangedError, match="did not keep the text") as excinfo:
+        await poster.post_chain(thread, already_posted=prefix)
+
+    assert excinfo.value.artifacts is not None
+    assert [tweet.text for tweet in fake.tweets] == ["Chain one", "Chain two"]
+    assert fake.create_requests == []
+    entry = poster.ledger.get(thread.content_hash)
+    assert entry is not None
+    assert entry.status is LedgerStatus.FAILED
+    assert [tweet.id for tweet in entry.posted] == [prefix[0].id, prefix[1].id]
+
+
+async def test_chain_seeds_the_ledger_with_exactly_the_caller_prefix(
+    poster_config: XPosterConfig, fake_x_factory: Any
+) -> None:
+    fake = fake_x_factory(dom="legacy")
+    seed_session(poster_config)
+    poster = make_poster(poster_config, fake)
+    thread = make_thread("Chain one", "Chain two", "Chain three", key="chain-stale")
+    poster.ledger.begin(thread.content_hash, strategy="replies", handle="olsa_test", n_tweets=3)
+    for index in range(3):
+        poster.ledger.record_tweet(thread.content_hash, chain_record(index))
+    poster.ledger.mark_unknown(thread.content_hash, "a stale attempt")
+    prefix = seed_fake_prefix(fake, ["Chain one"])
+    observed: list[int] = []
+
+    def on_posted(tweet: PostedTweet) -> None:
+        entry = poster.ledger.get(thread.content_hash)
+        assert entry is not None
+        observed.extend(item.index for item in entry.posted)
+        raise RuntimeError("stop after inspecting the seeded record")
+
+    with pytest.raises(PostOutcomeUnknownError):
+        await poster.post_chain(thread, already_posted=prefix, on_posted=on_posted)
+
+    # Stale indexes the caller did not accept are gone; the seeded record holds
+    # exactly the prefix plus the tweet this run just captured.
+    assert observed == [0, 1]

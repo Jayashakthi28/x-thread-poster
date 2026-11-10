@@ -25,12 +25,14 @@ study, and has not been observed in a real logged-in session. The final
 
 - **Status:** Accepted (2026-11-09)
 - **Verification:** VERIFIED (the source imports no `olsa` module, tested in
-  `tests/test_public_api.py`, and its test suite runs on its own) / UNVERIFIED
-  (the OLSA integration has not been done)
+  `tests/test_public_api.py`, and its test suite runs on its own). The OLSA
+  integration now exists on the unmerged branch `feat/x-thread-publish` (OLSA
+  ADR-0085) as a thin `ThreadPublisher` adapter; it has **not** been run live
+  through the pipeline yet.
 
 ### Context
 
-The OLSA pipeline needs an X destination eventually, but the browser path is
+The OLSA pipeline needed an X destination, but the browser path is
 policy-risky, slow and needs its own session lifecycle. Developing it inside
 `olsa-post-pipeline` would mix a new external service, a new browser profile and
 a new failure model into a pipeline that is already complete and running. The
@@ -48,14 +50,17 @@ models are cheap to import.
 
 - The package can be tested, installed and released without the pipeline. The
   offline fake of X and the real-Chrome integration tests are self-contained.
-- Integration is a later, explicit change in the OLSA repository: a
-  `SocialPublisher` adapter and an ADR. The sketch is in
-  [`integration.md`](integration.md).
-- Two ledgers exist: `xposter`'s own `ledger.json` and OLSA's `posts.json`.
-  Integration must treat one as the source of truth for idempotency and keep
-  them consistent, or a retry can be skipped by one and attempted by the other.
+- Integration is a separate change in the OLSA repository. It now exists on the
+  unmerged branch `feat/x-thread-publish` as `adapters/x_session.py`, a thin
+  adapter behind the `ThreadPublisher` port with an optional `x-session` extra
+  (OLSA ADR-0085); [`integration.md`](integration.md) describes it.
+- Two ledgers exist: `xposter`'s own `ledger.json` and OLSA's durable
+  `x_thread.json` record. OLSA's record is the authority for resume and
+  idempotency; the package ledger is forensic evidence and pacing memory. They
+  can disagree after a manual deletion on X, so one must be explicitly
+  authoritative rather than both deciding.
 - A separate package needs its own versioning, release and dependency pinning.
-  The pipeline's optional `x` extra is the seam.
+  The pipeline's optional `x-session` extra is the seam.
 
 ### Alternatives considered
 
@@ -601,13 +606,14 @@ process restart so a cron or a human does not accidentally start Chrome again.
 
 ---
 
-## 10. Layered selectors and `doctor --dom` calibration
+## 10. Layered selectors, `doctor --dom` and `doctor --dom-reply` calibration
 
 - **Status:** Accepted
 - **Verification:** **VERIFIED-LIVE** for the authenticated classic composer,
   two-composer scoping and a real 2-tweet thread on the 2026-11-09/10 test
   account; VERIFIED against the offline fake in both classic and new-client
-  variants / the new-client authenticated DOM remains UNVERIFIED
+  variants / the new-client authenticated DOM, the **reply composer** and the
+  **reply-by-reply resume path** remain **UNVERIFIED-LIVE**.
 
 ### Context
 
@@ -626,6 +632,11 @@ inner `[role="dialog"][aria-modal="true"]` plus a `mask`. An unscoped selector
 matches both editors. The first live dry run failed safely with "no visible
 match for composer_root" because the unscoped candidate resolved to the hidden
 background compositor; nothing was typed or posted.
+
+The reply composer is a **different page** under a status permalink, with an
+inline box or a modal, possible unrelated articles before the focal one and its
+own submit control. It therefore gets a separate calibration command rather than
+being inferred from the `/compose/post` report.
 
 ### Decision
 
@@ -653,6 +664,27 @@ background compositor; nothing was typed or posted.
   JSON report to a private artifact directory, then closes and attempts to
   discard. It never submits. The live `Save post?` discard sheet itself remains
   **UNVERIFIED**; only the offline fake covers that branch.
+- `xposter doctor --dom-reply STATUS_URL` is the read-only reply-composer
+  counterpart. It accepts an x.com status URL or a numeric id, requires the
+  configured handle, and validates that the status belongs to **that account**
+  before `authenticated_page` starts; another handle is refused before Chrome.
+  It opens the status page, waits up to 20 s for the focal article (identified by
+  an anchor ending `/status/<id>`; with several articles it refuses to guess),
+  measures the composer/tweet selectors in phase R, and clicks **only** the
+  focal article's reply icon through the phase-R guard (`Post`/`Reply`/`Schedule`/
+  `Save`/`Delete`/`Edit` are always refused). It waits up to 10 s for the reply
+  composer, records whether it is modal or inline, its buttons, submit control
+  and enabled state, Draft.js blocks, sanitised HTML and screenshots, types the
+  harmless marker `xposter reply calibration`, measures phase R2, then cleans up:
+  a modal is closed with Close/Escape and only the `Save post?` sheet's
+  **Discard** is clicked (never Save); an inline composer is cleared and the
+  page navigated away. It writes `reply-composer.html`, the page-region HTML, a
+  JSON report and `reply-a/b/c` screenshots to private artifacts. It never
+  submits and writes no ledger row.
+- The **reply composer** and the **reply-by-reply `post_chain` resume path** are
+  `UNVERIFIED-LIVE`: the offline fake covers modal/inline composers, decoy
+  articles, submit enablement, Draft.js, cleanup and the phase-R guard, but no
+  live reply has been observed or posted.
 - A missing composer selector is called out explicitly; other missing selectors
   (for example delete controls) are reported but do not block posting. If the
   composer never rendered, the report says the counts are **inconclusive**, not
@@ -663,6 +695,16 @@ background compositor; nothing was typed or posted.
 - Calibration is a required first step after login and after an X UI change. The
   code cannot auto-heal a selector table; it can only fail with artifacts and a
   report.
+- `doctor --dom-reply` covers the reply composer separately because a status
+  page is not `/compose/post`: it has an inline or modal reply box, unrelated
+  articles can precede the focal one, and the reply icon is the only click the
+  phase-R guard permits. Its report is evidence for updating reply selectors,
+  not proof that a resume will work; only a live resumed thread can prove that.
+  Both remain `UNVERIFIED-LIVE`.
+- The composer batch and the reply-by-reply resume share the same typing,
+  read-back and click-barrier code, but not the same page or the same live
+  evidence. A fresh `post_chain` uses the verified composer path; a non-empty
+  prefix takes the unverified reply path.
 - The authenticated classic DOM is now the primary target. The new-client
   selectors remain useful because X can migrate the account or serve a different
   client, but they have only been exercised against the offline fake.
@@ -1108,6 +1150,24 @@ own handle was used, nobody else was notified.
 - The default cap is 5 distinct non-self handles per thread; see decision 13.
   A real author-tagging design must be a deliberate operator decision.
 
+## Live verification log — resumable chains and reply calibration (2026-11-10)
+
+**Scope:** offline tests only (real local Chrome against the in-process fake of
+`x.com`); no live reply was posted and no live reply composer was opened.
+
+- `XPoster.post_chain` fresh composer path, callback order, prefix seeding,
+  complete-prefix early return, prefix validation, pacing on the remaining
+  tweets, parked/refused paths and callback-failure handling are covered by
+  `tests/test_poster.py` against the fake.
+- `xposter doctor --dom-reply` and `parse_status_target` are covered by
+  `tests/test_diagnose.py` and `tests/test_cli.py`: own-account URL/numeric id,
+  refusal of another handle before Chrome, modal and inline composers, decoy
+  articles, submit state, Draft.js, Discard-only cleanup, inline clear-and-
+  navigate and the phase-R click guard.
+- Neither the reply composer nor the reply-by-reply resume has been exercised
+  against the live site. Both are `UNVERIFIED-LIVE`; the first live test must be
+  on a test account.
+
 ## Verification matrix
 
 | Area | Evidence | Status |
@@ -1132,6 +1192,9 @@ own handle was used, nobody else was notified.
 | Typed `@handle` recognition and typeahead space guard | live test account, 2026-11-10 (real 2-tweet post, own handle only) | **VERIFIED-LIVE** for own handle incl. line-final/tweet-final mentions and blank lines; other accounts/notifications/hashtag/cashtag/nonexistent handles UNVERIFIED |
 | Mentions of other accounts, notification delivery, hashtag/cashtag typeahead, nonexistent handles | — | **UNVERIFIED live** |
 | Selector fallbacks, classic and new-client DOM | `tests/test_selectors.py`, `tests/test_fake_x.py` + live `--dom` observation | VERIFIED (offline fake) / **classic authenticated DOM VERIFIED-LIVE**; new-client authenticated DOM UNVERIFIED |
+| `doctor --dom-reply` reply calibration (modal/inline, decoy articles, submit state, Draft.js, Discard-only cleanup, phase-R guard) | `tests/test_diagnose.py`, `tests/test_cli.py`, offline fake | VERIFIED (offline) / **UNVERIFIED-LIVE** |
+| `post_chain` reply-by-reply resume (non-empty accepted prefix) | `tests/test_poster.py`, offline fake | VERIFIED (offline) / **UNVERIFIED-LIVE** |
+| `post_chain` fresh composer path and callback order | `tests/test_poster.py`, offline fake; the composer path is verified live separately | VERIFIED (offline); no pipeline-driven live run |
 | CLI commands and exit codes | `tests/test_cli.py` | VERIFIED (offline) |
 | Plain-Chrome login + `verify` | live test account, 2026-11-09/10 | **VERIFIED-LIVE**; 2FA and unusual-activity block UNVERIFIED |
 | `doctor --tells` in visible mode | live test account, 2026-11-09 | **VERIFIED-LIVE** (webdriver false, no `HeadlessChrome`, real UA-CH brands) |
@@ -1150,10 +1213,11 @@ own handle was used, nobody else was notified.
 | Whether X flags, locks or suspends the account | — | **Not guaranteeable** |
 
 The remaining live acceptance tests are the ones listed above as **UNVERIFIED**:
-the replies strategy; alt text end to end; Premium note-tweets; the untested
-image variants (>2 images, 4 per tweet, GIF/WebP/JPEG, near-limit/slow uploads,
-images with replies); mentions of other accounts, notification delivery,
-hashtag/cashtag typeahead and nonexistent handles; `doctor --drafts` and the
-live discard sheet; Xvfb/Linux; 20+ tweet threads; the submit-shortcut fallback;
-and long-term challenge/rate-limit/12-hour keepalive behaviour. The runbook
-covers the sequence.
+the replies strategy; the reply composer (`doctor --dom-reply`) and the
+reply-by-reply `post_chain` resume; alt text end to end; Premium note-tweets;
+the untested image variants (>2 images, 4 per tweet, GIF/WebP/JPEG, near-limit/
+slow uploads, images with replies); mentions of other accounts, notification
+delivery, hashtag/cashtag typeahead and nonexistent handles; `doctor --drafts`
+and the live discard sheet; Xvfb/Linux; 20+ tweet threads; the submit-shortcut
+fallback; and long-term challenge/rate-limit/12-hour keepalive behaviour. The
+runbook covers the sequence.

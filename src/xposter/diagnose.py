@@ -178,6 +178,39 @@ _DEFAULT_CLEANUP_POLL_S = 0.2
 _DEFAULT_DRAFTS_WAIT_S = 6.0
 _DEFAULT_MEDIA_WAIT_S = 30.0
 _DEFAULT_MEDIA_POLL_S = 0.25
+_DEFAULT_REPLY_COMPOSER_WAIT_S = 10.0
+_REPLY_CALIBRATION_TEXT = "xposter reply calibration"
+_REPLY_SELECTOR_NAMES = tuple(
+    name for name in SELECTORS if name.startswith(("composer_", "tweet_"))
+)
+_REPLY_EDITOR_SELECTORS = (
+    '[data-testid^="tweetTextarea_"]',
+    '[contenteditable="true"][role="textbox"]',
+    '[contenteditable="true"][data-contents="true"]',
+    'textarea[aria-multiline="true"]',
+)
+_REPLY_SUBMIT_SELECTORS = (
+    '[data-testid="tweetButtonInline"]',
+    '[data-testid="tweetButton"]',
+    'button[type="submit"]',
+    'button:text-is("Reply")',
+    "[data-fx-submit]",
+)
+_REPLY_MODAL_SELECTORS = (
+    f"{_MODAL_SCOPE}[data-fx-composer]",
+    f"{_MODAL_SCOPE}:has([data-fx-composer])",
+    f'{_MODAL_SCOPE}:has([data-testid^="tweetTextarea_"])',
+    f'{_MODAL_SCOPE}:has([contenteditable="true"][role="textbox"])',
+    f'{_MODAL_SCOPE}:has([contenteditable="true"][data-contents="true"])',
+    f'{_MODAL_SCOPE}:has(textarea[aria-multiline="true"])',
+    f"{_MODAL_SCOPE}:has([data-modal-slot-surface])",
+)
+_STATUS_PATH_RE = re.compile(r"^/(?P<handle>[A-Za-z0-9_]{1,15})/status/(?P<id>\d+)$")
+_REPLY_NEXT_STEP = (
+    "Next: compare reply-composer.html with the poster's reply selectors, update "
+    "selectors.py, then re-run `xposter doctor --dom-reply <status-url>` on a "
+    "test account. Nothing was posted."
+)
 
 _MEDIA_CALIBRATION_NAME = "xposter-calibration.png"
 _MEDIA_MATCH_NAMES = (
@@ -235,14 +268,22 @@ class UnsafeClickError(RuntimeError):
 
 
 def assert_safe_click(
-    *, text: str = "", aria_label: str = "", data_testid: str = "", phase: str = ""
+    *,
+    text: str = "",
+    aria_label: str = "",
+    data_testid: str = "",
+    phase: str = "",
+    in_focal_article: bool = False,
 ) -> None:
     """Refuse any click that could submit a post or save a draft.
 
     The add-post, drafts, close/discard and (in phase D only) media controls are
     identified by exact names. In phase D the alt-text education sheet may only
-    be left with exact ``No, thanks``; ``Sure`` is always refused. Post, Reply,
-    Schedule, Save, Delete and Edit are always refused, including in phase D.
+    be left with exact ``No, thanks``; ``Sure`` is always refused. Phase R is the
+    read-only reply calibration: it may click only the reply icon resolved
+    inside the focal tweet article (``in_focal_article=True``), never a submit
+    control. Post, Reply, Schedule, Save, Delete and Edit are always refused,
+    including in phases D and R.
     """
     label = text.strip().lower()
     aria = aria_label.strip().lower()
@@ -255,7 +296,16 @@ def assert_safe_click(
         "scheduleoption",
     }
     submit_labels = {"post", "post all", "reply", "schedule", "schedule post", "save"}
-    if testid in blocked_testids or label in submit_labels:
+    if testid in blocked_testids:
+        raise UnsafeClickError(f"Refusing to click a submit/save control: {label or testid!r}.")
+    if (
+        phase == "R"
+        and in_focal_article
+        and (testid == "reply" or aria == "reply")
+        and not re.search(r"post|schedule|save|delete|edit", f"{label} {testid}")
+    ):
+        return
+    if label in submit_labels:
         raise UnsafeClickError(f"Refusing to click a submit/save control: {label or testid!r}.")
     if label == "sure" or testid == "alttexteducationsheetprimaryaction":
         raise UnsafeClickError(
@@ -377,6 +427,56 @@ class DomReport:
     close_path: str = ""
     media: MediaReport | None = None
     note: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StatusTarget:
+    """A validated own-account status permalink for reply calibration."""
+
+    tweet_id: str
+    handle: str
+    url: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyReport:
+    """Everything the read-only reply calibration learned."""
+
+    target: StatusTarget
+    artifacts: Path
+    rendered: bool = True
+    waited_s: float = 0.0
+    timeout_s: float = _DEFAULT_WAIT_S
+    composer_waited_s: float = 0.0
+    composer_timeout_s: float = _DEFAULT_REPLY_COMPOSER_WAIT_S
+    composer_kind: str = "none"
+    composer_found: bool = False
+    note: str = ""
+    rows: tuple[DomRow, ...] = ()
+    matches: dict[str, list[tuple[str, int]]] | None = None
+    composer_buttons: tuple[ButtonInfo, ...] = ()
+    composer_buttons_after: tuple[ButtonInfo, ...] = ()
+    submit_control: dict[str, object] | None = None
+    submit_enabled_after_typing: bool | None = None
+    draftjs: bool | None = None
+    composer_html: Path | None = None
+    page_region_html: Path | None = None
+    screenshot: Path | None = None
+    screenshots: tuple[Path, ...] = ()
+    report_json: Path | None = None
+    cleanup_ok: bool = True
+    dialog_closed: bool = True
+    discard_action: str = "none"
+    discard_sheet: tuple[ButtonInfo, ...] = ()
+    close_path: str = "no-composer"
+    close_attempts: int = 0
+    close_click: dict[str, Any] | None = None
+    close_retry: dict[str, Any] | None = None
+    after_close: tuple[dict[str, Any], ...] = ()
+    after_close_screenshot: Path | None = None
+    after_close_html: Path | None = None
+    inline_cleared: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,6 +860,94 @@ def _click_summary(info: Mapping[str, Any]) -> str:
         f"dispatched={bool(info.get('dispatched'))} "
         f"box={info.get('box')} hit={hit_text} error={info.get('error', '')!r}"
     )
+
+
+def format_reply_report(report: ReplyReport) -> list[str]:
+    """Render the reply calibration table, composer evidence and cleanup state."""
+    target = report.target
+    lines = [
+        f"Reply calibration: @{target.handle} /status/{target.tweet_id}; "
+        f"composer={report.composer_kind}; nothing was posted.",
+    ]
+    if not report.rendered:
+        lines.append(
+            f"!! focal tweet did not render within {report.timeout_s:g} s; "
+            "no reply icon was clicked."
+        )
+    if report.note:
+        lines.append(f"note: {report.note}")
+    lines.append(f"{'selector':<28} {'R':>4} {'R2':>4}  matching candidate")
+    for row in report.rows:
+        first, second = _reply_phase_counts(row)
+        if report.rendered or row.count:
+            candidate = _short(row.candidate) if row.candidate else "MISSING"
+        else:
+            candidate = "(not measured)"
+        marker = ""
+        if row.missing and report.composer_found and is_composer_selector(row.name):
+            marker = "  <-- composer selector missing"
+        lines.append(f"{row.name:<28} {first:>4} {second:>4}  {candidate}{marker}")
+
+    lines.append("")
+    if report.composer_found:
+        lines.append(
+            f"Reply composer: {report.composer_kind}; waited {report.composer_waited_s:.1f} s."
+        )
+        submit = report.submit_control
+        if isinstance(submit, Mapping):
+            state = "disabled" if submit.get("disabled") else "enabled"
+            lines.append(
+                "Submit control: "
+                f"text={submit.get('text')!r} aria={submit.get('aria_label')!r} "
+                f"testid={submit.get('data_testid')!r} {state}"
+            )
+        else:
+            lines.append("Submit control: NOT FOUND")
+        if report.submit_enabled_after_typing is not None:
+            lines.append(
+                "After typing: submit enabled"
+                if report.submit_enabled_after_typing
+                else "After typing: submit still disabled"
+            )
+        if report.draftjs is not None:
+            lines.append(f"Editor: {'Draft.js blocks' if report.draftjs else 'no Draft.js blocks'}")
+        if report.composer_buttons:
+            lines.append(
+                "Composer buttons: " + "; ".join(map(_button_summary, report.composer_buttons))
+            )
+        if (
+            report.composer_buttons_after
+            and report.composer_buttons_after != report.composer_buttons
+        ):
+            lines.append(
+                "Composer buttons after typing: "
+                + "; ".join(map(_button_summary, report.composer_buttons_after))
+            )
+        if report.composer_html is not None:
+            lines.append(f"Reply composer HTML: {report.composer_html}")
+        if report.page_region_html is not None:
+            lines.append(f"Reply page region HTML: {report.page_region_html}")
+        if report.inline_cleared is not None:
+            lines.append(f"Inline editor cleared: {'yes' if report.inline_cleared else 'NO'}")
+        for path in report.screenshots:
+            lines.append(f"Screenshot: {path}")
+    else:
+        lines.append("Reply composer: NOT FOUND")
+
+    lines.append(
+        f"Cleanup: {'ok' if report.cleanup_ok else 'FAILED'}; dialog closed: "
+        f"{'yes' if report.dialog_closed else 'NO'}; draft saved: no; path: "
+        f"{report.close_path}; action: {report.discard_action}"
+    )
+    if report.discard_sheet:
+        lines.append("Discard sheet: " + "; ".join(map(_button_summary, report.discard_sheet)))
+    if not report.cleanup_ok:
+        lines.extend(["!" * 72, "REPLY CLEANUP FAILED", _CLEANUP_WARNING, "!" * 72])
+    if report.report_json is not None:
+        lines.append(f"Report: {report.report_json}")
+    lines.append(f"Artifacts: {report.artifacts}")
+    lines.append(_REPLY_NEXT_STEP)
+    return lines
 
 
 def format_drafts_report(report: DraftsReport) -> list[str]:
@@ -2837,6 +3025,625 @@ async def dom_report(config: XPosterConfig, store: SessionStore, **kw: Any) -> D
             media=media_report,
             note=note,
         )
+
+
+def parse_status_target(value: str, config: XPosterConfig) -> StatusTarget:
+    """Validate an own-account status URL or numeric id before any browser work.
+
+    The reply calibration types into a reply box under a real tweet. Pointing it
+    at another account's tweet is out of scope and unsafe, so the configured
+    handle must own the status. A bare id has no handle to compare, so it is
+    accepted only when ``--handle``/``XPOSTER_HANDLE`` is configured and the URL
+    is built from that account.
+    """
+    configured = (config.handle or "").strip().lstrip("@")
+    if not configured:
+        raise ConfigurationError(
+            "Reply calibration only types under your own tweet; set --handle "
+            "(or XPOSTER_HANDLE) before running `doctor --dom-reply`."
+        )
+    raw = value.strip()
+    if not raw:
+        raise ConfigurationError("`--dom-reply` needs a status URL or a numeric status id.")
+    if raw.isdigit():
+        return StatusTarget(
+            tweet_id=raw,
+            handle=configured,
+            url=f"{config.base_url.rstrip('/')}/{configured}/status/{raw}",
+            path=f"/{configured}/status/{raw}",
+        )
+
+    parsed = urlsplit(raw)
+    base_host = (urlsplit(config.base_url).hostname or "x.com").lower()
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or host not in {
+        base_host,
+        "x.com",
+        "www.x.com",
+    }:
+        raise ConfigurationError(
+            f"`--dom-reply` needs an x.com status URL or a bare numeric id, got {value!r}."
+        )
+    path = parsed.path.rstrip("/") or "/"
+    match = _STATUS_PATH_RE.fullmatch(path)
+    if match is None:
+        raise ConfigurationError(
+            f"{value!r} is not a status URL like https://x.com/<handle>/status/<id>."
+        )
+    url_handle = match.group("handle")
+    if url_handle.lower() != configured.lower():
+        raise ConfigurationError(
+            f"Status URL belongs to @{url_handle}, but the configured handle is "
+            f"@{configured}. Reply calibration only types under your own tweet."
+        )
+    tweet_id = match.group("id")
+    return StatusTarget(
+        tweet_id=tweet_id,
+        handle=configured,
+        url=f"{config.base_url.rstrip('/')}/{configured}/status/{tweet_id}",
+        path=f"/{configured}/status/{tweet_id}",
+    )
+
+
+async def reply_report(
+    config: XPosterConfig, store: SessionStore, status: str, **kw: Any
+) -> ReplyReport:
+    """Calibrate the reply composer on one of the configured account's tweets.
+
+    Nothing is submitted. The path follows ``doctor --dom``: wait for the live
+    page to render, measure the selectors, open the reply composer through the
+    focal article's reply icon, type a harmless marker, then discard/clear
+    everything before returning. The status target is validated before
+    ``authenticated_page`` is entered, so a wrong handle never starts Chrome.
+    """
+    target = parse_status_target(status, config)
+    wait_timeout_s = float(kw.pop("wait_timeout_s", _DEFAULT_WAIT_S))
+    wait_interval_s = max(0.01, float(kw.pop("wait_interval_s", _DEFAULT_POLL_S)))
+    composer_timeout_s = float(kw.pop("composer_timeout_s", _DEFAULT_REPLY_COMPOSER_WAIT_S))
+    composer_poll_s = max(0.01, float(kw.pop("composer_poll_s", 0.1)))
+    networkidle_timeout_ms = int(kw.pop("networkidle_timeout_ms", _DEFAULT_NETWORKIDLE_MS))
+    cleanup_timeout_s = float(kw.pop("cleanup_timeout_s", _DEFAULT_CLEANUP_S))
+    cleanup_poll_s = max(0.01, float(kw.pop("cleanup_poll_s", _DEFAULT_CLEANUP_POLL_S)))
+    sleep = cast(Callable[[float], Awaitable[None]], kw.pop("sleep", asyncio.sleep))
+    clock = cast(Callable[[], float], kw.pop("clock", time.monotonic))
+
+    kw.setdefault("check_login", False)
+    kw.setdefault("goto", target.path)
+    async with authenticated_page(config, store, **kw) as authed:
+        page = authed.page
+        artifacts = store.new_artifacts_dir("dom-reply-calibration")
+
+        if networkidle_timeout_ms > 0:
+            with suppress(PlaywrightError):
+                await page.wait_for_load_state("networkidle", timeout=networkidle_timeout_ms)
+
+        started = clock()
+        article: Locator | None = None
+        polls = max(1, int(wait_timeout_s / wait_interval_s) + 1)
+        for _ in range(polls):
+            article = await _focal_article(page, target.tweet_id)
+            if article is not None:
+                break
+            await sleep(wait_interval_s)
+        waited_s = max(0.0, clock() - started)
+        rendered = article is not None
+        note = ""
+        if not rendered:
+            note = (
+                f"focal tweet /status/{target.tweet_id} never rendered within "
+                f"{wait_timeout_s:g} s; no reply icon was clicked"
+            )
+
+        screenshots: list[Path] = []
+        phase_r = await _measure_reply_selectors(page)
+        shot_a = await _screenshot(page, store, artifacts, "reply-a")
+        if shot_a is not None:
+            screenshots.append(shot_a)
+
+        phase_r2 = phase_r
+        composer: Locator | None = None
+        composer_kind = "none"
+        composer_waited_s = 0.0
+        matches: dict[str, list[tuple[str, int]]] = {}
+        composer_buttons: tuple[ButtonInfo, ...] = ()
+        composer_buttons_after: tuple[ButtonInfo, ...] = ()
+        submit_control: dict[str, object] | None = None
+        submit_enabled_after_typing: bool | None = None
+        draftjs: bool | None = None
+        composer_html: Path | None = None
+        page_region_html: Path | None = None
+        inline_cleared: bool | None = None
+        cleanup: _CleanupResult | None = None
+
+        if rendered and article is not None:
+            icon = await _reply_icon(article)
+            if icon is None:
+                note = _append_note(note, "focal article has no reply icon")
+            else:
+                text, aria_label, testid = await _element_meta(icon)
+                clicked = False
+                try:
+                    assert_safe_click(
+                        text=text,
+                        aria_label=aria_label,
+                        data_testid=testid,
+                        phase="R",
+                        in_focal_article=True,
+                    )
+                    await icon.click(timeout=3000)
+                    clicked = True
+                except (PlaywrightError, UnsafeClickError) as exc:
+                    note = _append_note(note, f"reply icon click failed: {exc}"[:200])
+                if clicked:
+                    composer_started = clock()
+                    composer, composer_kind = await _wait_reply_composer(
+                        page,
+                        sleep,
+                        timeout_s=composer_timeout_s,
+                        poll_s=composer_poll_s,
+                    )
+                    composer_waited_s = max(0.0, clock() - composer_started)
+                    if composer is None:
+                        note = _append_note(
+                            note,
+                            f"reply composer did not appear within {composer_timeout_s:g} s",
+                        )
+                    else:
+                        matches = await _measure_reply_selectors(page)
+                        composer_buttons = await _buttons_in(composer)
+                        submit_control = await _reply_submit(composer)
+                        composer_html = await _write_reply_composer_html(store, artifacts, composer)
+                        page_region_html = await _write_reply_region_html(
+                            store, artifacts, article, composer, composer_kind
+                        )
+                        shot_b = await _screenshot(page, store, artifacts, "reply-b")
+                        if shot_b is not None:
+                            screenshots.append(shot_b)
+                        editor = await _reply_editor(composer)
+                        if editor is None:
+                            note = _append_note(note, "reply composer editor was not found")
+                        else:
+                            try:
+                                await editor.click()
+                                await page.keyboard.type(_REPLY_CALIBRATION_TEXT)
+                                await sleep(0.5)
+                            except PlaywrightError as exc:
+                                note = _append_note(
+                                    note, f"typing into the reply editor failed: {exc}"[:200]
+                                )
+                            phase_r2 = await _measure_reply_selectors(page)
+                            composer_buttons_after = await _buttons_in(composer)
+                            submit_after = await _reply_submit(composer)
+                            if submit_after is not None:
+                                submit_enabled_after_typing = not bool(submit_after.get("disabled"))
+                            draftjs = await _reply_draftjs(composer)
+                            shot_c = await _screenshot(page, store, artifacts, "reply-c")
+                            if shot_c is not None:
+                                screenshots.append(shot_c)
+                        if composer_kind == "modal":
+                            try:
+                                cleanup = await _close_and_discard(
+                                    page,
+                                    store=store,
+                                    artifacts=artifacts,
+                                    sleep=sleep,
+                                    timeout_s=cleanup_timeout_s,
+                                    poll_s=cleanup_poll_s,
+                                )
+                            except PlaywrightError:
+                                cleanup = _CleanupResult(
+                                    (),
+                                    False,
+                                    False,
+                                    "failed",
+                                    "failed",
+                                    0,
+                                    None,
+                                    None,
+                                    (),
+                                    None,
+                                    None,
+                                )
+                        else:
+                            cleanup, inline_cleared = await _clear_inline_reply(
+                                page, composer, sleep, timeout_s=cleanup_timeout_s
+                            )
+
+        if cleanup is None:
+            cleanup = _CleanupResult(
+                (), True, True, "none", "no-composer", 0, None, None, (), None, None
+            )
+
+        rows = tuple(_phase_row(name, (phase_r, phase_r2)) for name in _REPLY_SELECTOR_NAMES)
+        report_path = store.write_artifact(
+            artifacts,
+            "report.json",
+            json.dumps(
+                {
+                    "captured_at": datetime.now(UTC).isoformat(),
+                    "handle": authed.handle or target.handle,
+                    "display": str(authed.display),
+                    "status_url": target.url,
+                    "tweet_id": target.tweet_id,
+                    "rendered": rendered,
+                    "waited_s": round(waited_s, 3),
+                    "timeout_s": wait_timeout_s,
+                    "composer_waited_s": round(composer_waited_s, 3),
+                    "composer_timeout_s": composer_timeout_s,
+                    "composer_kind": composer_kind,
+                    "composer_found": composer is not None,
+                    "note": note,
+                    "phases": ["R", "R2"],
+                    "rows": [
+                        {
+                            "name": row.name,
+                            "candidate": row.candidate,
+                            "count": row.count,
+                            "missing": row.missing,
+                            "phase_counts": {
+                                label: value
+                                for label, value in zip(
+                                    ("R", "R2"),
+                                    _reply_phase_counts(row),
+                                    strict=True,
+                                )
+                            },
+                            "candidates": [
+                                {"selector": selector, "count": count}
+                                for selector, count in row.candidates
+                            ],
+                        }
+                        for row in rows
+                    ],
+                    "matches": {
+                        name: [
+                            {"selector": selector, "count": count} for selector, count in matches
+                        ]
+                        for name, matches in matches.items()
+                    },
+                    "composer_buttons": [button.to_json() for button in composer_buttons],
+                    "composer_buttons_after": [
+                        button.to_json() for button in composer_buttons_after
+                    ],
+                    "submit_control": submit_control,
+                    "submit_enabled_after_typing": submit_enabled_after_typing,
+                    "draftjs": draftjs,
+                    "composer_html": (composer_html.name if composer_html is not None else None),
+                    "page_region_html": (
+                        page_region_html.name if page_region_html is not None else None
+                    ),
+                    "screenshots": [path.name for path in screenshots],
+                    "screenshot": screenshots[0].name if screenshots else None,
+                    "discard_sheet": [button.to_json() for button in cleanup.discard_sheet],
+                    "discard_action": cleanup.discard_action,
+                    "dialog_closed": cleanup.dialog_closed,
+                    "draft_saved": False,
+                    "cleanup_ok": cleanup.cleanup_ok,
+                    "cleanup_path": cleanup.close_path,
+                    "close_path": cleanup.close_path,
+                    "close_attempts": cleanup.close_attempts,
+                    "close_click": cleanup.close_click,
+                    "close_retry": cleanup.close_retry,
+                    "after_close": list(cleanup.after_close),
+                    "after_close_screenshot": (
+                        cleanup.after_close_screenshot.name
+                        if cleanup.after_close_screenshot is not None
+                        else None
+                    ),
+                    "after_close_html": (
+                        cleanup.after_close_html.name
+                        if cleanup.after_close_html is not None
+                        else None
+                    ),
+                    "inline_cleared": inline_cleared,
+                    "next_step": _REPLY_NEXT_STEP,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
+
+        return ReplyReport(
+            target=target,
+            artifacts=artifacts,
+            rendered=rendered,
+            waited_s=waited_s,
+            timeout_s=wait_timeout_s,
+            composer_waited_s=composer_waited_s,
+            composer_timeout_s=composer_timeout_s,
+            composer_kind=composer_kind,
+            composer_found=composer is not None,
+            note=note,
+            rows=rows,
+            matches=matches,
+            composer_buttons=composer_buttons,
+            composer_buttons_after=composer_buttons_after,
+            submit_control=submit_control,
+            submit_enabled_after_typing=submit_enabled_after_typing,
+            draftjs=draftjs,
+            composer_html=composer_html,
+            page_region_html=page_region_html,
+            screenshot=screenshots[0] if screenshots else None,
+            screenshots=tuple(screenshots),
+            report_json=report_path,
+            cleanup_ok=cleanup.cleanup_ok,
+            dialog_closed=cleanup.dialog_closed,
+            discard_action=cleanup.discard_action,
+            discard_sheet=cleanup.discard_sheet,
+            close_path=cleanup.close_path,
+            close_attempts=cleanup.close_attempts,
+            close_click=cleanup.close_click,
+            close_retry=cleanup.close_retry,
+            after_close=cleanup.after_close,
+            after_close_screenshot=cleanup.after_close_screenshot,
+            after_close_html=cleanup.after_close_html,
+            inline_cleared=inline_cleared,
+        )
+
+
+def _append_note(note: str, addition: str) -> str:
+    return (note + "; " if note else "") + addition
+
+
+def _reply_phase_counts(row: DomRow) -> tuple[int, int]:
+    counts = list(row.phase_counts or (row.count,))
+    return (counts[0], counts[1] if len(counts) > 1 else counts[0])
+
+
+async def _measure_reply_selectors(page: Page) -> dict[str, list[tuple[str, int]]]:
+    """Measure every composer_* and tweet_* selector on the reply page."""
+    return {name: await match_report_visible(page, name) for name in _REPLY_SELECTOR_NAMES}
+
+
+async def _focal_article(page: Page, tweet_id: str) -> Locator | None:
+    """Return the article whose anchor ends in ``/status/<id>``, or ``None``.
+
+    A status page can render a quoted post, an ad or a pinned reply before the
+    focal tweet. Calibration must never click a reply icon on the wrong article,
+    so with several articles it only accepts an exact anchor match; a single
+    visible article is unambiguous and is accepted even without the permalink.
+    """
+    candidates = ", ".join(SELECTORS["tweet_article"].candidates)
+    articles = await _visible_items(page.locator(candidates))
+    suffix = f"/status/{tweet_id}"
+    for article in articles:
+        try:
+            if await article.locator(f'a[href$="{suffix}"]').count():
+                return article
+        except PlaywrightError:
+            continue
+    # The offline status fake (and some live partial renders) only has the
+    # author anchor, not a permalink. A single visible article is unambiguous,
+    # so accept it; with several articles, refuse to guess which one is focal.
+    return articles[0] if len(articles) == 1 else None
+
+
+async def _reply_icon(article: Locator) -> Locator | None:
+    selectors = (
+        '[data-testid="reply"]',
+        'button[aria-label="Reply"]',
+        '[role="button"][aria-label="Reply"]',
+    )
+    for selector in selectors:
+        found = await _first_visible(article.locator(selector))
+        if found is not None:
+            return found
+    return None
+
+
+async def _find_reply_composer(page: Page) -> tuple[Locator | None, str]:
+    """Return the reply composer and whether it is a modal or an inline box."""
+    for selector in _REPLY_MODAL_SELECTORS:
+        modal = await _first_visible(page.locator(selector))
+        if modal is not None:
+            return modal, "modal"
+    editor = await _find_visible(page, _REPLY_EDITOR_SELECTORS)
+    if editor is None:
+        return None, "none"
+    return await _inline_reply_scope(editor), "inline"
+
+
+async def _wait_reply_composer(
+    page: Page,
+    sleep: Callable[[float], Awaitable[None]],
+    *,
+    timeout_s: float,
+    poll_s: float,
+) -> tuple[Locator | None, str]:
+    attempts = max(1, int(timeout_s / poll_s) + 1)
+    for _ in range(attempts):
+        composer, kind = await _find_reply_composer(page)
+        if composer is not None:
+            return composer, kind
+        await sleep(poll_s)
+    return await _find_reply_composer(page)
+
+
+async def _inline_reply_scope(editor: Locator) -> Locator:
+    """Climb from the inline editor to the widest composer box under ``main``."""
+    node = editor
+    best: Locator | None = None
+    submits = ", ".join(_REPLY_SUBMIT_SELECTORS)
+    for _ in range(12):
+        try:
+            parent = node.locator("xpath=..")
+            parent_tag = await parent.evaluate("el => el.tagName.toLowerCase()")
+        except PlaywrightError:
+            break
+        if parent_tag in {"body", "html"}:
+            break
+        if parent_tag == "main":
+            return best if best is not None else node
+        if await _first_visible(parent.locator(submits)) is not None:
+            best = parent
+        node = parent
+    return best if best is not None else editor
+
+
+async def _reply_editor(composer: Locator) -> Locator | None:
+    return await _find_visible_scope(composer, _REPLY_EDITOR_SELECTORS)
+
+
+async def _find_visible_scope(scope: Locator, selectors: Sequence[str]) -> Locator | None:
+    for selector in selectors:
+        found = await _first_visible(scope.locator(selector))
+        if found is not None:
+            return found
+    return None
+
+
+async def _reply_submit(composer: Locator) -> dict[str, object] | None:
+    submit = await _find_visible_scope(composer, _REPLY_SUBMIT_SELECTORS)
+    if submit is None:
+        return None
+    text, aria_label, testid = await _element_meta(submit)
+    try:
+        disabled = await submit.is_disabled()
+    except PlaywrightError:
+        disabled = False
+    return {
+        "text": text,
+        "aria_label": aria_label,
+        "data_testid": testid,
+        "disabled": disabled,
+    }
+
+
+async def _reply_draftjs(composer: Locator) -> bool:
+    return await _first_visible(composer.locator('[data-block="true"]')) is not None
+
+
+async def _write_reply_composer_html(
+    store: SessionStore, artifacts: Path, composer: Locator
+) -> Path | None:
+    try:
+        markup = await composer.evaluate("el => el.outerHTML")
+    except PlaywrightError:
+        return None
+    if not isinstance(markup, str):
+        return None
+    return store.write_artifact(
+        artifacts,
+        "reply-composer.html",
+        _truncate_html(_redact_blob_urls(sanitise_html(markup)), 300 * 1024),
+        sanitise=True,
+    )
+
+
+async def _write_reply_region_html(
+    store: SessionStore,
+    artifacts: Path,
+    article: Locator,
+    composer: Locator,
+    kind: str,
+) -> Path | None:
+    """Dump the focal article's surroundings, plus the modal layer when present."""
+    parts: list[str] = []
+    article_parent = await _outer_html_or_self(article)
+    if article_parent is not None:
+        parts.append(article_parent)
+    if kind == "modal":
+        modal_layer = await _outer_html_or_self(composer)
+        if modal_layer is not None and modal_layer not in parts:
+            parts.append(modal_layer)
+    if not parts:
+        return None
+    markup = "\n\n<!-- reply composer layer -->\n\n".join(parts)
+    return store.write_artifact(
+        artifacts,
+        "reply-page-region.html",
+        _truncate_html(_redact_blob_urls(sanitise_html(markup)), 200 * 1024),
+        sanitise=True,
+    )
+
+
+async def _outer_html_or_self(node: Locator) -> str | None:
+    target = node
+    try:
+        parent = node.locator("xpath=..")
+        parent_tag = await parent.evaluate("el => el.tagName.toLowerCase()")
+        if parent_tag not in {"body", "html"}:
+            target = parent
+    except PlaywrightError:
+        target = node
+    try:
+        markup = await target.evaluate("el => el.outerHTML")
+    except PlaywrightError:
+        return None
+    return markup if isinstance(markup, str) else None
+
+
+async def _reply_editor_text(editor: Locator) -> str:
+    try:
+        tag = await editor.evaluate("el => el.tagName.toLowerCase()")
+        if tag in {"textarea", "input"}:
+            return await editor.input_value()
+        return await editor.inner_text()
+    except PlaywrightError:
+        return ""
+
+
+async def _clear_inline_reply(
+    page: Page,
+    composer: Locator,
+    sleep: Callable[[float], Awaitable[None]],
+    *,
+    timeout_s: float,
+) -> tuple[_CleanupResult, bool]:
+    """Clear an inline reply box, navigate away, and prove no leave prompt."""
+    editor = await _reply_editor(composer)
+    cleared = False
+    if editor is not None:
+        with suppress(PlaywrightError):
+            await editor.click()
+            await page.keyboard.press("ControlOrMeta+a")
+            await page.keyboard.press("Delete")
+            await sleep(0.2)
+            cleared = not (await _reply_editor_text(editor)).strip()
+
+    prompts: list[str] = []
+
+    def _on_dialog(dialog: Any) -> None:
+        prompts.append(str(dialog.type))
+        asyncio.create_task(dialog.dismiss())
+
+    page.on("dialog", _on_dialog)
+    navigated = False
+    try:
+        await page.goto(
+            "about:blank",
+            wait_until="domcontentloaded",
+            timeout=max(1000, int(timeout_s * 1000)),
+        )
+        navigated = page.url == "about:blank"
+    except PlaywrightError:
+        navigated = False
+    finally:
+        page.remove_listener("dialog", _on_dialog)
+    await sleep(0.2)
+    cleanup_ok = navigated and not prompts
+    action = (
+        "cleared-and-navigated"
+        if cleared and navigated
+        else ("navigated" if navigated else "failed")
+    )
+    return (
+        _CleanupResult(
+            (),
+            navigated,
+            cleanup_ok,
+            action,
+            "inline-clear",
+            0,
+            None,
+            None,
+            (),
+            None,
+            None,
+        ),
+        cleared,
+    )
 
 
 async def _measure_all(page: Page) -> dict[str, list[tuple[str, int]]]:

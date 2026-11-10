@@ -3,6 +3,34 @@
 All notable changes to this package are recorded here. The format is loosely
 based on Keep a Changelog; this package has no released history before 0.1.0.
 
+## [0.2.0] — 2026-11-10
+
+### Added
+
+- **Resumable Python API:** `XPoster.post_chain(thread, *,
+  already_posted=(), on_posted=None) -> PostedThread` for callers that own the
+  durable record (the OLSA pipeline). An empty prefix uses the verified composer
+  `Post all` path and calls `on_posted(PostedTweet)` in capture order as each
+  `CreateTweet` response arrives; a non-empty accepted prefix resumes reply by
+  reply (**not verified against the live site**). xposter's own ledger never
+  blocks a chain call — the caller is the authority — but pacing, the session
+  lock, login/handle checks, park-on-challenge, the click barrier and the
+  read-back still apply. A prefix covering the whole thread returns without a
+  browser; a 26-tweet thread is refused before Chrome. The ledger is seeded
+  with the caller's prefix as forensic evidence.
+- **Reply calibration:** `xposter doctor --dom-reply STATUS_URL` opens one of the
+  configured account's own tweets and calibrates the reply composer read-only.
+  It accepts a status URL or numeric id, refuses another account before Chrome,
+  clicks only the focal article's reply icon under the phase-R guard, types a
+  harmless marker, records modal/inline composer details, submit state and
+  Draft.js, then discards (modal) or clears and navigates away (inline). It
+  never submits. The reply composer is **UNVERIFIED-LIVE** (offline fake only),
+  and so is the reply-by-reply `post_chain` resume path.
+- **Docs:** README Python API section for `post_chain`; runbook reply-calibration
+  procedure and artifacts; design decision 10 and the verification matrix cover
+  the reply composer and resume path; `docs/integration.md` now describes the
+  implemented OLSA adapter on the unmerged `feat/x-thread-publish` branch.
+
 ## [0.1.0] — 2026-11-09
 
 Initial functionally complete release. The package is standalone and has not yet
@@ -69,7 +97,7 @@ been integrated into the OLSA pipeline.
   0–8 and a policy reminder.
 - **Docs:** README with the policy warning first, design decision log, operating
   runbook (including logging in from a server via X11 forwarding/VNC and the
-  last-resort `storage_state.json` transfer), OLSA integration sketch, and the
+  last-resort `storage_state.json` transfer), OLSA integration notes, and the
   two research memos plus the selector study.
 - **Tests:** offline unit tests, a real-local-Chrome browser integration suite,
   an in-process fake of `x.com`, a no-injection/override source guard, and a
@@ -133,17 +161,19 @@ safety.
 
 ### Known limitations
 
-- Still **UNVERIFIED live**: the replies strategy; alt text end to end (off by
-  default); more than two images or four images per tweet; GIF/WebP/JPEG uploads
-  (only PNG tested); images near 5 MiB or slow uploads; images with the replies
-  strategy; `doctor --drafts` (first live run mis-read timeline posts; scoped fix
-  offline-tested only — check Drafts manually, including for a possible earlier
-  calibration leftover); Premium long posts/note-tweets; the live calibration
-  `Save post?` discard sheet; mentions of other accounts, notification
-  delivery, hashtag/cashtag typeahead and nonexistent handles; Xvfb/Linux; 20+
-  tweet threads; the submit-shortcut fallback; and all long-term account safety,
-  challenge/rate-limit and 12-hour keepalive behaviour. Video is explicitly
-  unsupported and xposter never resizes images. See `docs/design.md`.
+- Still **UNVERIFIED live**: the replies strategy; the reply composer
+  (`doctor --dom-reply`) and the reply-by-reply `post_chain` resume (offline
+  fake only); no pipeline-driven run through OLSA yet; alt text end to end (off
+  by default); more than two images or four images per tweet; GIF/WebP/JPEG
+  uploads (only PNG tested); images near 5 MiB or slow uploads; images with the
+  replies strategy; `doctor --drafts` (first live run mis-read timeline posts;
+  scoped fix offline-tested only — check Drafts manually, including for a
+  possible earlier calibration leftover); Premium long posts/note-tweets; the
+  live calibration `Save post?` discard sheet; mentions of other accounts,
+  notification delivery, hashtag/cashtag typeahead and nonexistent handles;
+  Xvfb/Linux; 20+ tweet threads; the submit-shortcut fallback; and all long-term
+  account safety, challenge/rate-limit and 12-hour keepalive behaviour. Video is
+  explicitly unsupported and xposter never resizes images. See `docs/design.md`.
 - No CAPTCHA solving, fingerprint/UA spoofing, JavaScript patching, proxies,
   automatic password login, multi-account automation or official-API backend.
 - The account can still be flagged, locked or suspended. X's Automation Rules

@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     from .sessions import RefreshResult as RefreshResult
     from .sessions import SessionInfo as SessionInfo
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 #: Names imported on first access instead of at package import time.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {

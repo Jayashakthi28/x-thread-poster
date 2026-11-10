@@ -227,6 +227,40 @@ black "Save"). **Escape closes too much**; leave that editor via the **back
 arrow**. The alt text field and Save are still UNVERIFIED live; phase D records
 the screens but does not claim the full alt flow works.
 
+**Reply composer calibration (`doctor --dom-reply`).** This is the read-only
+counterpart for the reply box used by the resume path:
+
+```bash
+# Global options go before the subcommand. Pass your own status URL or bare id.
+xposter --handle olsa doctor --dom-reply https://x.com/olsa/status/1234567890
+xposter --handle olsa doctor --dom-reply 1234567890
+```
+
+It requires `--handle`/`XPOSTER_HANDLE` and accepts only **your own** account's
+status; another handle is refused before Chrome starts. It opens the status
+page, waits up to 20 s for the focal article (the one whose anchor ends
+`/status/<id>`; with several visible articles it refuses to guess), measures the
+composer/tweet selectors in phase R, clicks **only** the reply icon inside the
+focal article (the phase-R guard refuses Post/Reply/Schedule/Save/Delete/Edit),
+waits up to 10 s for the reply composer, records whether it is modal or inline,
+its buttons, submit state, Draft.js blocks, sanitised HTML and screenshots,
+types the harmless marker `xposter reply calibration`, measures phase R2, then
+cleans up. A modal is closed with Close/Escape and, if the `Save post?` sheet
+appears, **Discard only** — it never clicks Save; an inline composer is cleared
+and the page navigated away. It never submits and writes no ledger row.
+
+It writes `reply-a.png`, `reply-b.png`, `reply-c.png` (when captured),
+`reply-composer.html`, `reply-page-region.html` and `report.json` to a private
+artifact directory. Read `composer=modal|inline|none`, the submit control and
+whether it enabled after typing, then compare `reply-composer.html` with the
+reply selectors in `src/xposter/selectors.py`; update only from the report and
+re-run.
+
+**`doctor --dom-reply` and the reply-by-reply resume path are UNVERIFIED-LIVE.**
+Only the offline fake covers the reply composer; no live reply has been opened
+or posted. Run the calibration on a test account first, and never treat a
+successful calibration as proof that a resumed thread will post correctly.
+
 `doctor --drafts` is read-only: it opens the composer, clicks only the Drafts
 control inside the modal, lists what is visible, and dismisses with Escape. It
 never edits or deletes a draft. Its first live run mis-read timeline posts as
@@ -266,8 +300,9 @@ more than two images / four per tweet, GIF/WebP/JPEG (only PNG tested), near
 5 MiB or slow uploads, and images with the replies strategy. Video is
 unsupported; xposter never resizes, so callers must keep images under 5 MiB.
 
-Still **UNVERIFIED live**: the replies strategy, alt text end to end, the
-untested image variants above, Premium note-tweets, `doctor --drafts` (check
+Still **UNVERIFIED live**: the replies strategy and the reply composer
+(`doctor --dom-reply`), alt text end to end, the untested image variants above,
+Premium note-tweets, `doctor --drafts` (check
 Drafts manually once, including for a possible earlier calibration leftover),
 the calibration `Save post?` discard sheet, Xvfb/Linux, 20+ tweet threads, the
 submit-shortcut fallback, and all long-term account safety/challenge/rate-limit/
@@ -754,6 +789,7 @@ under `~/.olsa/x/artifacts/`:
 | --- | --- | --- |
 | `<UTC timestamp>-<label>/` | `screenshot.png`, `page.html`, `url.txt` | A posting/delete UI failure. Label is the strategy and thread hash, or `delete-<id>`. |
 | `<UTC timestamp>-dom-calibration/` | `phase-a.png`, `phase-b.png`, `phase-c.png` (when rendered), `compose-dialog.html`, `report.json`; with `--with-media` also `phase-d.png`, `phase-d-alt.png`, `phase-d-edit.png`, `media-attachments.html`, `media-modal.html`, `media-alt-intro.html`, `media-alt-editor.html`, `media-edit-editor.html` (when captured) | `xposter doctor --dom [--with-media]`. |
+| `<UTC timestamp>-dom-reply-calibration/` | `reply-a.png`, `reply-b.png`, `reply-c.png` (when captured), `reply-composer.html`, `reply-page-region.html` and `report.json` | `xposter --handle NAME doctor --dom-reply STATUS_URL` (read-only; **UNVERIFIED live**). |
 | `<UTC timestamp>-drafts-audit/` | `drafts.png`, `drafts.html`, `drafts.json` | `xposter doctor --drafts` (read-only; still UNVERIFIED live). |
 
 - Only the newest `keep_artifacts` directories (default 10) and those younger
@@ -876,9 +912,10 @@ duplicates.
 | `N distinct @mentions exceed max_mentions_per_thread=...` (2) | The thread tags more distinct accounts than the policy cap allows. | Tag only accounts that expect it; use fewer mentions, or raise `--max-mentions`/`XPOSTER_MAX_MENTIONS_PER_THREAD` deliberately on a test account. |
 | `doctor --drafts` lists timeline posts as drafts | First live-run scoping bug; the scoped fix is offline-tested only. | Treat the output as unverified; check the account's Drafts panel manually. |
 | `doctor --dom` reports every composer selector missing or the composer never rendered | The measurement raced React's render (the first live run did exactly this), or the login/profile is wrong. | Re-run; the command now waits up to 20 s for the editor. Confirm `status`/`verify` first. Do not edit selectors from an inconclusive report. |
+| `doctor --dom-reply` reports the focal tweet never rendered, no reply icon, or no reply composer | The status URL/id is wrong or not visible to this account, the page is still loading, or the reply UI changed. | Confirm the URL is your own and the post still exists; re-run. Inspect `reply-*.png` and `reply-composer.html`; do not force a post from an inconclusive calibration. |
 | `Ledger corrupt` (6) | `ledger.json` exists but cannot be parsed or read. | Restore it from backup, or check the account and run `xposter ledger --reset-corrupt`; posting stays blocked until one is done. |
 | `Post outcome unknown` (6) | A click may have landed; no id captured. | Section 9. Check the profile before `--force`. |
-| `UI changed` / selector message (7) | X changed the DOM, the account is on a different client, or a modal is covering the target. | Read the newest artifact; run `doctor --dom`; update `selectors.py` only from the live report. |
+| `UI changed` / selector message (7) | X changed the DOM, the account is on a different client, or a modal is covering the target. | Read the newest artifact; run `doctor --dom` (or `--dom-reply` when a resume failed); update `selectors.py` only from the live report. |
 | `The Post button stayed disabled` (7) | Content over the weighted limit, a media upload still pending, or a markup change. | The message names the weight/limit when it is content; otherwise inspect artifacts and media. |
 | `The media preview did not appear` (7) | Unsupported file, too large, upload failure, or selector drift. | Try a small JPEG/PNG; check X's limits; re-run `doctor --dom --with-media`. |
 | `The media upload did not finish within ...` (7) | Slow upload, near-limit image, or the preview counter is outside the attachments container. | Check the diagnostics; resize/re-encode, or run `doctor --dom --with-media` to see the live markup. |

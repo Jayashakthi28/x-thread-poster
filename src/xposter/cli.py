@@ -744,6 +744,17 @@ def doctor(
             help="Also run phase D: attach a generated PNG, inspect media controls, remove it.",
         ),
     ] = False,
+    dom_reply: Annotated[
+        str | None,
+        typer.Option(
+            "--dom-reply",
+            metavar="STATUS_URL",
+            help=(
+                "Calibrate the reply composer on your own status URL or numeric id. "
+                "Read-only: nothing is posted. Requires --handle."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Diagnose the host, the session and (on request) X's live DOM/drafts/media."""
     state = _state(ctx)
@@ -766,6 +777,13 @@ def doctor(
         typer.echo("DOM calibration (live; nothing is posted):")
         report = _call(diagnose.dom_report(state.config, store, with_media=with_media), state)
         for line in diagnose.format_dom_report(report):
+            typer.echo(line)
+
+    if dom_reply is not None:
+        typer.echo("")
+        typer.echo("Reply calibration (live; read-only; nothing is posted):")
+        reply = _call(diagnose.reply_report(state.config, store, dom_reply), state)
+        for line in diagnose.format_reply_report(reply):
             typer.echo(line)
 
     if drafts:

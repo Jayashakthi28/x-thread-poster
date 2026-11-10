@@ -3,8 +3,9 @@
 Post a thread to X (Twitter) by driving a real Google Chrome window with a saved,
 one-time login. The package is standalone: it does not import the OLSA pipeline
 and can be tested, installed and run on its own. See
-[`docs/integration.md`](docs/integration.md) for how it would plug into OLSA
-later.
+[`docs/integration.md`](docs/integration.md) for how the unmerged OLSA branch
+`feat/x-thread-publish` integrates it (OLSA ADR-0085); no pipeline-driven post
+has been run live yet.
 
 ## Read this first: policy and account risk
 
@@ -96,6 +97,9 @@ The package then:
   by scraping the DOM or the success toast,
 - records every step in a local JSON ledger **before and after each click**, so
   a rerun cannot silently double-post,
+- also exposes `XPoster.post_chain()` for callers that own the durable record:
+  a fresh thread uses the verified composer batch; a non-empty accepted prefix
+  resumes reply by reply,
 - enforces local pacing and, when configured, quiet hours even when X would
   accept the post, and
 - **parks** on a challenge, lock, suspension or rate limit instead of retrying.
@@ -273,6 +277,72 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+`post_thread` is the ledger-authoritative call: xposter's own ledger decides
+whether the same visible thread was already posted.
+
+### Resumable chains with `post_chain`
+
+For callers that keep their own durable record, `post_chain` trusts the caller's
+accepted prefix instead of deciding from xposter's ledger:
+
+```python
+from xposter import PostedTweet
+
+# Exactly the accepted prefix, indexes 0..k-1, loaded from the caller's record.
+accepted: tuple[PostedTweet, ...] = load_accepted_prefix()
+
+
+def on_posted(tweet: PostedTweet) -> None:
+    save_to_durable_record(tweet)  # the caller's record is the authority
+
+
+posted = await poster.post_chain(
+    thread,
+    already_posted=accepted,
+    on_posted=on_posted,
+)
+print(posted.strategy, posted.complete)
+```
+
+`XPoster.post_chain(thread, *, already_posted=(), on_posted=None) -> PostedThread`
+behaves as follows:
+
+- **Fresh thread (empty prefix).** Posts the whole thread through the verified
+  composer `Post all` path — one batch click, per-tweet images, the Draft.js
+  read-back before the click, and ids read from X's `CreateTweet` responses.
+  `on_posted(PostedTweet)` is called synchronously for each captured id, in
+  capture order; the ledger records the tweet before the callback runs.
+- **Non-empty prefix.** Resumes by navigating to the last accepted tweet and
+  replying **one post at a time**, waiting for `on_posted` to return before
+  typing the next. This reply-by-reply resume path is **not verified against the
+  live site** and its result uses `strategy="replies"`.
+- **The caller owns idempotency.** `already_posted` must be exactly indexes
+  `0..k-1`, in order, with non-empty ASCII-digit ids; a malformed prefix is
+  refused before Chrome. `post_chain` never consults `Ledger.decide`, so a
+  previous `PENDING`, `UNKNOWN` or `POSTED` entry (including a raised click
+  barrier) never blocks a chain call. The ledger is still seeded with the
+  caller's prefix as forensic evidence. A prefix tweet with an empty `url` gets
+  one rebuilt from the handle and id, so the returned `PostedThread` has URLs
+  when the account is known.
+- **Pacing, lock, login and safety still apply.** The check is on the remaining
+  tweets only; the session lock, login/handle check, park-on-challenge, click
+  barrier, read-back, 25-tweet limit and mention cap all still run. The session
+  and page are still opened for a non-empty remainder.
+- **Complete prefix.** If `already_posted` covers the whole thread, a complete
+  `PostedThread` is returned without starting Chrome; the ledger and pacer are
+  left untouched.
+- **Callback failure.** In a composer batch the click has already dispatched
+  every request: a non-`XPosterError` from `on_posted` is remembered, later
+  callbacks are skipped, every captured id is still recorded, and the batch is
+  allowed to settle before `PostOutcomeUnknownError` is raised with the cause
+  chained. An `XPosterError` from the callback is re-raised unchanged after the
+  batch settles. In the reply-by-reply resume path a callback failure stops the
+  chain immediately: a non-`XPosterError` becomes `PostOutcomeUnknownError` with
+  the accepted tweets, and an `XPosterError` is re-raised.
+- **Strategy is chosen by the method.** `XPosterConfig.strategy` does not matter
+  here: `post_chain` uses `composer` for a fresh thread and `replies` only to
+  resume. A 26-tweet thread is rejected with `ValidationError` before Chrome.
+
 Notes:
 
 - `Thread.key` is part of the content hash. Use a stable identity for the
@@ -315,7 +385,16 @@ Global options go **before** the subcommand:
 | `xposter post ...` | Previews, confirms and posts one thread. | 0, 2, 3, 4, 5, 6, 7, 8, 1 |
 | `xposter delete TARGET... [--yes]` | Deletes posts by status URL or numeric id; intended only for cleaning up test posts. | 0, 2, 3, 4, 7, 8, 1 |
 | `xposter ledger [--limit N] [--json] [--reset-corrupt]` | Shows recent ledger entries offline; `--reset-corrupt` quarantines an unreadable ledger after confirmation. | 0, 2, 6, 1 |
-| `xposter doctor [--dom] [--tells] [--drafts] [--with-media]` | Offline host/session checks; `--tells` measures the live browser; `--dom` calibrates selectors without submitting; `--with-media` adds phase D (generated PNG upload, attachment/alt markup capture, remove and discard); `--drafts` lists saved drafts read-only. | 0, 1 (failing checks), 2, 4, 8 |
+| `xposter doctor [--dom] [--dom-reply STATUS_URL] [--tells] [--drafts] [--with-media]` | Offline host/session checks; `--tells` measures the live browser; `--dom` calibrates the composer selectors without submitting; `--dom-reply` calibrates the **reply** composer read-only under one of the configured account's own statuses; `--with-media` adds phase D (generated PNG upload, attachment/alt markup capture, remove and discard); `--drafts` lists saved drafts read-only. | 0, 1 (failing checks), 2, 4, 8 |
+
+`doctor --dom-reply STATUS_URL` is the read-only reply-composer calibration. It
+requires `--handle` (or `XPOSTER_HANDLE`), accepts an x.com status URL or a
+numeric id for **your own** account, and refuses another account before Chrome
+starts. It opens the status page, clicks only the reply icon inside the focal
+tweet, types `xposter reply calibration`, records the modal/inline composer and
+submit state, then discards (modal) or clears and navigates away (inline). It
+never submits. The reply composer is **UNVERIFIED-LIVE**: only the offline fake
+covers it, so run it on a test account first.
 
 `post` accepts exactly one source: `--text`, `--file PATH` (or `-` for stdin), or
 `--thread-json PATH`. Add `--first TEXT` / `--first-file PATH` to pin a verbatim
@@ -528,9 +607,10 @@ the machine that posts. Log in on the machine that will post; copying
 - [`docs/runbook.md`](docs/runbook.md) — first login, calibration, live test,
   refresh timers, logging in from a server / moving to Linux, parked state, UNKNOWN entries, artifacts,
   backup and troubleshooting.
-- [`docs/integration.md`](docs/integration.md) — the future OLSA
-  `SocialPublisher` adapter, error mapping, configuration and integration
-  checklist.
+- [`docs/integration.md`](docs/integration.md) — the OLSA integration that now
+  exists on the unmerged `feat/x-thread-publish` branch (OLSA ADR-0085):
+  `ThreadPublisher` adapter, error mapping, settings, commands and the
+  still-open mention/alt-text/region items.
 - [`docs/research/risk-and-limits.md`](docs/research/risk-and-limits.md) — the
   policy/limits memo behind the warning and the API cost estimate.
 - [`docs/research/field-reports.md`](docs/research/field-reports.md) — independent

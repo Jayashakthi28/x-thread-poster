@@ -11,6 +11,14 @@ the human-timing plans. Two invariants drive the whole design:
   tool and raises a typed error. Only an HTTP 5xx on the very first click may be
   retried once, because the server proved it created nothing.
 
+``post_chain`` is the pipeline-facing exception to the ledger's authority: the
+caller passes its own accepted prefix because its durable record, not this
+ledger, decides what already exists. A fresh thread rides the verified composer
+batch; a resumed prefix uses the reply chain, because the composer returns its
+ids only at the end and cannot resume. A chain call still records every id and
+every click barrier, but a previous PENDING, UNKNOWN or POSTED entry never
+blocks it; only parking, validation and pacing can.
+
 Tweet ids are read passively from the ``CreateTweet`` responses. Scraping the
 DOM or the success toast would race the client's own render and break on
 localisation.
@@ -41,11 +49,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import logging
 import random
 import sys
+import time
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -78,6 +88,8 @@ from .store import ParkInfo, SessionStore
 
 __all__ = ["ClickNotDispatchedError", "ContextHook", "XPoster", "human_click"]
 
+_LOGGER = logging.getLogger("xposter.poster")
+
 ContextHook = Callable[[BrowserContext], Awaitable[None]]
 
 # X's composer caps a thread at 25 posts; the client refuses to add the 26th.
@@ -85,6 +97,11 @@ _MAX_THREAD_TWEETS = 25
 # A thread is one ``Post all`` click but N sequential requests; waiting a fixed
 # 15 s for the whole batch would fail a legitimate 20-post thread.
 _POST_WAIT_S_PER_TWEET = 15.0
+# Reading a response body normally takes milliseconds. A live run once saw a
+# ~60 s delay between the response headers and the parsed body, so this budget
+# is deliberately generous: timing out a body that would have arrived would
+# turn a known success into an avoidable UNKNOWN outcome.
+_BODY_TIMEOUT_S = 120.0
 _DELETE_WAIT_S = 15.0
 _POLL_INTERVAL_S = 0.05
 _PROBE_INTERVAL_S = 0.5
@@ -262,6 +279,22 @@ async def _point_hits(locator: Locator, point: tuple[float, float]) -> bool:
     return bool(hit)
 
 
+@dataclass(frozen=True, slots=True)
+class ResponseTiming:
+    """When one relevant X response arrived and finished reading its body.
+
+    ``index`` is the 1-based sequence number within this watcher, never a tweet
+    id, so the timing can be logged without leaking content. Times are
+    monotonic seconds relative to :meth:`_ResponseWatcher.start`.
+    """
+
+    index: int
+    arrived_s: float
+    body_done_s: float
+    status: int
+    ok: bool
+
+
 class _ResponseWatcher:
     """Collects ``CreateTweet``/``DeleteTweet`` responses without touching the DOM.
 
@@ -270,23 +303,30 @@ class _ResponseWatcher:
     handlers are synchronous, so the callback only queues the interesting
     responses; the posting coroutine drains the queue, which keeps the id
     handling in one place and makes the check order deterministic.
+
+    Every drained response records when its headers arrived and when its body
+    finished reading. The body read is bounded by ``_BODY_TIMEOUT_S`` so one
+    slow response cannot block the whole batch (and the click barrier) forever.
     """
 
     def __init__(self, page: Page, *, deletion: bool = False) -> None:
         self._page = page
         self._deletion = deletion
         self._changed = asyncio.Event()
-        self._queue: list[Response] = []
+        self._queue: list[tuple[Response, float]] = []
         self._stopped = False
+        self._started_at: float | None = None
         self._handler = self._on_response
         self.on_created: Callable[[str], None] | None = None
         self.created: list[str] = []
         self.deleted: list[str] = []
         self.verdicts: list[guard.Verdict] = []
         self.statuses: list[int] = []
+        self.timings: list[ResponseTiming] = []
 
     def start(self) -> None:
         """Start listening; call before the click that triggers the request."""
+        self._started_at = time.monotonic()
         self._page.on("response", self._handler)
 
     def stop(self) -> None:
@@ -371,11 +411,11 @@ class _ResponseWatcher:
             url = response.url
             if self._deletion:
                 if guard.is_delete_tweet_response(url):
-                    self._queue.append(response)
+                    self._queue.append((response, self._elapsed()))
                     self._changed.set()
                 return
             if guard.is_create_tweet_response(url):
-                self._queue.append(response)
+                self._queue.append((response, self._elapsed()))
                 self._changed.set()
                 return
             if response.request.resource_type == "document":
@@ -386,15 +426,33 @@ class _ResponseWatcher:
         except (PlaywrightError, TypeError, ValueError):
             return
 
+    def _elapsed(self) -> float:
+        """Monotonic seconds since :meth:`start`, safe before it is called."""
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+        return time.monotonic() - self._started_at
+
     async def _drain(self) -> None:
         while self._queue:
-            await self._inspect(self._queue.pop(0))
+            response, arrived_s = self._queue.pop(0)
+            await self._inspect(response, arrived_s)
 
-    async def _inspect(self, response: Response) -> None:
+    async def _inspect(self, response: Response, arrived_s: float | None = None) -> None:
+        if arrived_s is None:
+            arrived_s = self._elapsed()
+        index = len(self.timings) + 1
+        status = 0
+        body_done_s = arrived_s
+        ok = False
         try:
             status = response.status
             self.statuses.append(status)
-            payload = await _response_json(response)
+            payload = await _response_json(
+                response,
+                index=index,
+            )
+            body_done_s = self._elapsed()
+            ok = payload is not None
             mapping = payload if isinstance(payload, Mapping) else None
             verdict = guard.classify_response(status, mapping)
             if verdict is not None:
@@ -412,14 +470,61 @@ class _ResponseWatcher:
                     self.on_created(created)
         except (PlaywrightError, TypeError, ValueError):
             return
+        finally:
+            timing = ResponseTiming(
+                index=index,
+                arrived_s=arrived_s,
+                body_done_s=body_done_s,
+                status=status,
+                ok=ok,
+            )
+            self.timings.append(timing)
+            _LOGGER.info(
+                "%s response #%d status=%d arrived=+%.1fs body=+%.1fs",
+                "DeleteTweet" if self._deletion else "CreateTweet",
+                timing.index,
+                timing.status,
+                timing.arrived_s,
+                timing.body_done_s,
+            )
 
 
-async def _response_json(response: Response) -> object | None:
-    """Return the parsed JSON body, or ``None`` when it is absent or not JSON."""
+async def _response_json(
+    response: Response,
+    *,
+    index: int = 0,
+    timeout_s: float | None = None,
+) -> object | None:
+    """Return the parsed JSON body, or ``None`` when it is absent or not JSON.
+
+    The read is bounded because one slow response body must not hold the whole
+    batch (and the click barrier) forever. The budget is read from
+    ``_BODY_TIMEOUT_S`` at call time so a test can shorten it.
+    """
+    budget = _BODY_TIMEOUT_S if timeout_s is None else timeout_s
     try:
-        return cast(object, await response.json())
+        return cast(object, await asyncio.wait_for(response.json(), timeout=budget))
+    except TimeoutError:
+        _LOGGER.warning(
+            "Response #%d body read timed out after %.2fs; id not captured",
+            index,
+            budget,
+        )
+        return None
     except (PlaywrightError, ValueError):
         return None
+
+
+def _response_timing_summary(timings: Sequence[ResponseTiming]) -> str:
+    """Compact, content-free timings for a short-batch unknown-outcome message."""
+    if not timings:
+        return "response timings: none"
+    parts = [
+        f"#{timing.index} status={timing.status} "
+        f"arrived=+{timing.arrived_s:.1f}s body=+{timing.body_done_s:.1f}s ok={timing.ok}"
+        for timing in timings
+    ]
+    return "response timings: " + "; ".join(parts)
 
 
 def _initial_pointer(page: Page) -> tuple[float, float]:
@@ -567,6 +672,11 @@ class _Attempt:
     began: bool = False
     clicked: bool = False
     captured: list[PostedTweet] = field(default_factory=list)
+    on_posted: Callable[[PostedTweet], None] | None = None
+    # A composer batch cannot be stopped once its one click is dispatched, so a
+    # callback failure is deferred until every CreateTweet response has settled.
+    defer_callback_errors: bool = False
+    callback_error: Exception | None = None
 
 
 class XPoster:
@@ -751,7 +861,7 @@ class XPoster:
                 if self.config.strategy is Strategy.COMPOSER:
                     await self._post_composer(page, thread, attempt)
                 else:
-                    await self._post_replies(page, thread, attempt, resume)
+                    await self._post_reply_chain(page, thread, attempt, resume)
             except LedgerCorruptError:
                 raise
             except Exception as exc:
@@ -770,6 +880,145 @@ class XPoster:
                 self._record_interruption(attempt, exc)
                 raise
             posted = self._completed(attempt, thread, resume)
+            self.ledger.complete(thread_hash, posted)
+            self.pacer.record_thread_done(len(thread.tweets))
+            return posted
+
+    async def post_chain(
+        self,
+        thread: Thread,
+        *,
+        already_posted: Sequence[PostedTweet] = (),
+        on_posted: Callable[[PostedTweet], None] | None = None,
+    ) -> PostedThread:
+        """Post ``thread`` as a resumable chain, trusting the caller's prefix.
+
+        A fresh thread (``already_posted`` empty) uses the **composer** path,
+        the only one verified against the live site: every tweet is typed into
+        the one ``/compose/post`` modal, images attach per tweet, the read-back
+        runs before the single ``Post all`` click, and ids are captured from
+        X's own ``CreateTweet`` responses. ``on_posted`` runs synchronously for
+        each captured id, in capture order, and the ledger records it before the
+        callback. A callback failure cannot stop a batch that is already in
+        flight: it is remembered, later callbacks are skipped, every id is still
+        recorded, and the batch is allowed to settle before
+        :class:`PostOutcomeUnknownError` reports every captured tweet.
+
+        A resumed thread (``already_posted`` non-empty) uses the **replies**
+        path: it navigates to the last accepted tweet's status URL and replies
+        for each remaining tweet, waiting and typing the next only after
+        ``on_posted`` returns. This path is **not verified against the live
+        site**; it exists only to finish a thread that stopped part-way, and its
+        ``PostedThread.strategy`` is ``"replies"``. A callback failure here
+        stops the chain immediately.
+
+        The caller's durable record is the authority on what already exists:
+        ``already_posted`` is exactly the accepted prefix (indexes ``0..k-1`` in
+        order), and this method never consults :meth:`Ledger.decide` for it. The
+        ledger is kept as forensic evidence and for pacing, so a previous
+        PENDING, UNKNOWN or POSTED entry for the same content never blocks a
+        chain call. This includes a raised click barrier from an interrupted
+        run: the caller decides what to resume from.
+
+        When ``already_posted`` covers the whole thread there is nothing to post:
+        a complete :class:`PostedThread` is returned without starting Chrome, and
+        the ledger and pacer are left untouched.
+        """
+        self.store.raise_if_parked()
+        self._validate_thread(thread)
+        thread_hash = thread.content_hash
+        prefix = self._validate_chain_prefix(thread, already_posted)
+        handle = self.config.handle or ""
+        prefix = tuple(
+            tweet if tweet.url else replace(tweet, url=self._status_url(handle, tweet.id))
+            for tweet in prefix
+        )
+        if len(prefix) == len(thread.tweets):
+            return PostedThread(
+                thread_hash=thread_hash,
+                handle=handle,
+                strategy="replies",
+                posted_at=self._stamp(),
+                tweets=prefix,
+                complete=True,
+            )
+
+        strategy = "replies" if prefix else "composer"
+        remaining = len(thread.tweets) - len(prefix)
+        self.pacer.check(remaining)
+        label = f"{strategy}-{thread_hash[:8]}"
+        async with sessions.authenticated_page(
+            self.config,
+            self.store,
+            playwright_factory=self._playwright_factory,
+            context_hook=self._context_hook,
+            goto="/home",
+        ) as session:
+            page = session.page
+            session_handle = session.handle or self.config.handle or ""
+            chain_prefix = tuple(
+                tweet
+                if tweet.url
+                else replace(tweet, url=self._status_url(session_handle, tweet.id))
+                for tweet in prefix
+            )
+            attempt = _Attempt(
+                thread_hash=thread_hash,
+                strategy=strategy,
+                handle=session_handle,
+                label=label,
+                # Prefix tweets count as accepted for every error payload and
+                # for the completeness check, but the callback only sees new ids.
+                captured=list(chain_prefix),
+                on_posted=on_posted,
+                defer_callback_errors=strategy == "composer",
+            )
+            existing = self.ledger.get(thread_hash)
+            self.ledger.begin(
+                thread_hash,
+                strategy=attempt.strategy,
+                handle=session_handle,
+                n_tweets=len(thread.tweets),
+                # The caller's prefix is authoritative. If the ledger still holds
+                # tweets the caller does not know about (for example after a crash
+                # between the click and the callback), clear them so the forensic
+                # record is seeded with exactly the accepted prefix. Ledger.begin
+                # keeps their ids in history and preserves previous_completed.
+                discard_recorded=(
+                    existing is not None
+                    and any(tweet.index >= len(chain_prefix) for tweet in existing.posted)
+                ),
+            )
+            attempt.began = True
+            # Seed the forensic record with the caller-owned prefix. The ledger's
+            # own history/previous_completed machinery preserves anything that
+            # was recorded before this call.
+            for tweet in chain_prefix:
+                self.ledger.record_tweet(thread_hash, tweet)
+            try:
+                if strategy == "composer":
+                    await self._post_composer(page, thread, attempt)
+                else:
+                    await self._post_reply_chain(page, thread, attempt, chain_prefix)
+                self._raise_deferred_callback_error(attempt)
+            except LedgerCorruptError:
+                raise
+            except Exception as exc:
+                self._record_failure(attempt, exc)
+                if isinstance(exc, PlaywrightError):
+                    artifacts = await self._capture_artifacts(page, label)
+                    raise UiChangedError(
+                        f"A browser operation failed while posting the chain: {exc}. "
+                        "Inspect the saved artifacts and retry after fixing the UI.",
+                        artifacts,
+                    ) from exc
+                if isinstance(exc, UiChangedError) and exc.artifacts is None:
+                    exc.artifacts = await self._capture_artifacts(page, label)
+                raise
+            except BaseException as exc:
+                self._record_interruption(attempt, exc)
+                raise
+            posted = self._completed(attempt, thread, chain_prefix)
             self.ledger.complete(thread_hash, posted)
             self.pacer.record_thread_done(len(thread.tweets))
             return posted
@@ -885,14 +1134,22 @@ class XPoster:
         )
         self._ensure_complete(attempt, thread, ())
 
-    async def _post_replies(
+    async def _post_reply_chain(
         self,
         page: Page,
         thread: Thread,
         attempt: _Attempt,
         resume: Sequence[PostedTweet],
     ) -> None:
-        """Post tweet one in the composer, then reply to each previous tweet."""
+        """Post tweet one in the composer, then reply to each previous tweet.
+
+        Shared by :meth:`post_thread`'s replies strategy and :meth:`post_chain`.
+        ``resume`` is the already-accepted prefix: its indexes are skipped and
+        its last tweet becomes the parent of the next reply. ``attempt.captured``
+        may also contain that prefix so error payloads include it; the two
+        sources are merged by index in :meth:`_last_known` and
+        :meth:`_ensure_complete`.
+        """
         recorded = {tweet.index: tweet for tweet in resume}
         if 0 not in recorded:
             root = await self._open_composer(page)
@@ -1073,7 +1330,8 @@ class XPoster:
                     if verdict.action is guard.Action.STOP_THREAD:
                         raise PostOutcomeUnknownError(
                             f"{verdict.reason} The thread stopped part-way; check "
-                            "the profile before continuing it.",
+                            "the profile before continuing it. "
+                            f"{_response_timing_summary(watcher.timings)}",
                             tuple(attempt.captured),
                         )
                     if verdict.action in _TERMINAL_ACTIONS:
@@ -1081,17 +1339,59 @@ class XPoster:
                 raise PostOutcomeUnknownError(
                     "The Post click produced no tweet id we could verify. Check "
                     f"{self.config.base_url} for a live copy before trying again; "
-                    "re-running with --force may duplicate what already landed.",
+                    "re-running with --force may duplicate what already landed. "
+                    f"{_response_timing_summary(watcher.timings)}",
                     tuple(attempt.captured),
                 )
             finally:
                 watcher.stop()
 
     def _record_posted(self, attempt: _Attempt, posted: PostedTweet) -> None:
-        """Remember one created tweet and persist it before anything else fails."""
+        """Remember one created tweet and persist it before anything else fails.
+
+        The caller's ``on_posted`` callback runs last, synchronously, so the
+        ledger entry already exists when the caller is asked to persist the id.
+        In a reply chain a callback failure stops immediately: the tweet is
+        live, so it becomes an unknown outcome carrying the accepted tweets. In
+        a composer batch the single click has already dispatched every request,
+        so the failure is remembered instead and the remaining ids are still
+        recorded before the batch settles.
+        """
         attempt.captured.append(posted)
         if attempt.began:
             self.ledger.record_tweet(attempt.thread_hash, posted)
+        callback = attempt.on_posted
+        if callback is None or attempt.callback_error is not None:
+            return
+        try:
+            callback(posted)
+        except Exception as exc:
+            if attempt.defer_callback_errors:
+                attempt.callback_error = exc
+                return
+            if isinstance(exc, XPosterError):
+                raise
+            raise PostOutcomeUnknownError(
+                f"Tweet {posted.id} (index {posted.index}) was accepted by X and recorded "
+                "in the ledger, but the on_posted callback failed before the caller could "
+                "persist it. Treat this tweet as live and do not post it again.",
+                tuple(attempt.captured),
+            ) from exc
+
+    def _raise_deferred_callback_error(self, attempt: _Attempt) -> None:
+        """Report a composer callback failure after the whole batch settled."""
+        exc = attempt.callback_error
+        if exc is None:
+            return
+        if isinstance(exc, XPosterError):
+            raise exc
+        raise PostOutcomeUnknownError(
+            "The composer batch was accepted by X and every captured id was recorded in "
+            f"the ledger, but the on_posted callback failed while reporting one of the "
+            f"{len(attempt.captured)} accepted tweets. Treat all of them as live and do "
+            "not post them again.",
+            tuple(attempt.captured),
+        ) from exc
 
     def _posted_tweet(self, index: int, tweet_id: str, thread: Thread, handle: str) -> PostedTweet:
         text = thread.tweets[index].text if 0 <= index < len(thread.tweets) else ""
@@ -2022,6 +2322,35 @@ class XPoster:
     def _entry_posted(self, thread_hash: str) -> tuple[PostedTweet, ...]:
         entry = self.ledger.get(thread_hash)
         return tuple(entry.posted) if entry is not None else ()
+
+    @staticmethod
+    def _validate_chain_prefix(
+        thread: Thread, already_posted: Sequence[PostedTweet]
+    ) -> tuple[PostedTweet, ...]:
+        """Require exactly the accepted prefix ``0..k-1`` before Chrome starts.
+
+        The caller's durable record is authoritative, so a malformed prefix is a
+        programming error that must never spend a post or a browser launch.
+        """
+        prefix = tuple(already_posted)
+        if len(prefix) > len(thread.tweets):
+            raise ValidationError(
+                f"already_posted has {len(prefix)} tweets but the thread only has "
+                f"{len(thread.tweets)}. The accepted prefix cannot be longer than the thread."
+            )
+        for expected, tweet in enumerate(prefix):
+            if tweet.index != expected:
+                raise ValidationError(
+                    "already_posted must be the accepted prefix in order: expected "
+                    f"index {expected} at position {expected}, got index {tweet.index}. "
+                    f"Supply indexes 0..{len(prefix) - 1} with no gaps or reordering."
+                )
+            if not tweet.id or not (tweet.id.isascii() and tweet.id.isdigit()):
+                raise ValidationError(
+                    f"already_posted[{expected}] has id {tweet.id!r}; X tweet ids must be "
+                    "non-empty ASCII digit strings."
+                )
+        return prefix
 
     def _distinct_mentions(self, thread: Thread) -> list[str]:
         """Distinct handles across the thread, ignoring the posting account."""

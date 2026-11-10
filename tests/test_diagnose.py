@@ -14,7 +14,8 @@ from typing import Any
 import pytest
 
 import xposter.diagnose as diagnose
-from xposter import Display, XPosterConfig
+from tests.fake_x import FakeTweet
+from xposter import ConfigurationError, Display, XPosterConfig
 from xposter.selectors import SELECTORS
 from xposter.store import SessionStore
 
@@ -308,6 +309,97 @@ async def _serve_compose(context: Any, markup: str) -> None:
         )
 
     await context.route("**/compose/post", handler)
+
+
+def _status_route_hook(fake: Any, path: str, *, extra_body: str = "", extra_head: str = "") -> Any:
+    """Serve the fake status page with reply-calibration test markup injected."""
+
+    async def hook(context: Any) -> None:
+        await fake.install(context)
+        _status, html = fake._render(path)
+        markup = str(html)
+        if extra_head:
+            if "</head>" in markup:
+                markup = markup.replace("</head>", extra_head + "</head>", 1)
+            else:
+                markup = extra_head + markup
+        if extra_body:
+            if "</body>" in markup:
+                markup = markup.replace("</body>", extra_body + "</body>", 1)
+            else:
+                markup += extra_body
+
+        async def handler(route: Any) -> None:
+            if route.request.resource_type != "document":
+                await route.fallback()
+                return
+            await route.fulfill(
+                status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=markup,
+            )
+
+        await context.route(f"**{path}", handler)
+
+    return hook
+
+
+_INLINE_REPLY_SCRIPT = """
+<script>
+(() => {
+  const inline = (el) => {
+    if (!el || el.dataset.fxInline === '1') return;
+    el.dataset.fxInline = '1';
+    el.removeAttribute('role');
+    el.removeAttribute('aria-modal');
+    el.removeAttribute('data-fx-composer');
+    el.id = 'fx-inline-reply';
+  };
+  new MutationObserver(() => {
+    document
+      .querySelectorAll('#fx-reply-slot [role="dialog"]')
+      .forEach(inline);
+  }).observe(document.body, { childList: true, subtree: true });
+})();
+</script>
+"""
+
+_DECOY_REPLY_SCRIPT = """
+<script>
+(() => {
+  const cfg = window.__FAKE_X__ || {};
+  const handle = cfg.handle || '';
+  const main = document.querySelector('main');
+  if (!main) return;
+  const decoy = document.createElement('article');
+  decoy.setAttribute('data-testid', 'tweet');
+  decoy.innerHTML =
+    '<a href="/' + handle + '/status/999">decoy</a>' +
+    '<button type="button" data-testid="reply" aria-label="Reply">Reply</button>';
+  main.insertBefore(decoy, main.firstChild);
+  const focal = document.querySelector('article[data-fx-tweet]');
+  if (focal && !focal.querySelector('a[href$="/status/111"]')) {
+    const link = document.createElement('a');
+    link.href = '/' + handle + '/status/111';
+    link.textContent = 'permalink';
+    focal.appendChild(link);
+  }
+})();
+</script>
+"""
+
+
+def _reply_fixture(fake: Any) -> str:
+    fake.tweets.append(
+        FakeTweet(
+            id="111",
+            text="focal tweet for reply calibration",
+            author=fake.handle,
+            in_reply_to=None,
+            media=(),
+        )
+    )
+    return f"/{fake.handle}/status/111"
 
 
 def _compose_route_hook(fake: Any, *, extra_head: str = "", extra_body: str = "") -> Any:
@@ -1573,3 +1665,305 @@ async def test_tells_report_passes_live_defaults(
 
     assert seen["check_login"] is False
     assert seen["goto"] == "/home"
+
+
+def test_parse_status_target_builds_an_own_account_url_from_a_bare_id(
+    tmp_home: XPosterConfig,
+) -> None:
+    config = tmp_home.with_overrides(handle="olsa")
+
+    target = diagnose.parse_status_target("123", config)
+
+    assert target.tweet_id == "123"
+    assert target.handle == "olsa"
+    assert target.url == "https://x.com/olsa/status/123"
+    assert target.path == "/olsa/status/123"
+
+
+def test_parse_status_target_accepts_the_configured_handle_case_insensitively(
+    tmp_home: XPosterConfig,
+) -> None:
+    config = tmp_home.with_overrides(handle="olsa")
+
+    target = diagnose.parse_status_target("https://x.com/OLSA/status/123?ref=timeline", config)
+
+    assert target.tweet_id == "123"
+    assert target.path == "/olsa/status/123"
+
+
+def test_parse_status_target_refuses_another_handle(tmp_home: XPosterConfig) -> None:
+    config = tmp_home.with_overrides(handle="olsa")
+
+    with pytest.raises(ConfigurationError, match="only types under your own tweet"):
+        diagnose.parse_status_target("https://x.com/intruder/status/123", config)
+
+
+def test_parse_status_target_requires_a_configured_handle(tmp_home: XPosterConfig) -> None:
+    with pytest.raises(ConfigurationError, match="set --handle"):
+        diagnose.parse_status_target("123", tmp_home)
+
+
+def test_parse_status_target_rejects_non_status_urls(tmp_home: XPosterConfig) -> None:
+    config = tmp_home.with_overrides(handle="olsa")
+
+    for value in (
+        "https://twitter.com/olsa/status/123",
+        "https://x.com/olsa/status/not-a-number",
+        "not-a-url",
+        "",
+    ):
+        with pytest.raises(ConfigurationError):
+            diagnose.parse_status_target(value, config)
+
+
+async def test_reply_report_refuses_another_handle_before_the_browser(
+    tmp_home: XPosterConfig,
+) -> None:
+    config = tmp_home.with_overrides(handle="olsa")
+    opened: list[object] = []
+
+    async def hook(context: Any) -> None:
+        opened.append(context)
+
+    with pytest.raises(ConfigurationError, match="belongs to @intruder"):
+        await diagnose.reply_report(
+            config,
+            SessionStore(config),
+            "https://x.com/intruder/status/123",
+            context_hook=hook,
+        )
+
+    assert opened == []
+
+
+def test_assert_safe_click_phase_r_allows_only_the_focal_reply_icon() -> None:
+    diagnose.assert_safe_click(
+        text="Reply",
+        aria_label="Reply",
+        data_testid="reply",
+        phase="R",
+        in_focal_article=True,
+    )
+    diagnose.assert_safe_click(text="", aria_label="Reply", phase="R", in_focal_article=True)
+
+    refused = (
+        {"text": "Reply", "aria_label": "Reply", "data_testid": "reply", "phase": "R"},
+        {"text": "Reply", "aria_label": "Reply", "data_testid": "reply"},
+        {"text": "Reply", "phase": "R", "in_focal_article": True},
+        {
+            "text": "Reply",
+            "data_testid": "tweetButtonInline",
+            "phase": "R",
+            "in_focal_article": True,
+        },
+        {
+            "text": "Reply",
+            "data_testid": "tweetButton",
+            "phase": "R",
+            "in_focal_article": True,
+        },
+        {
+            "text": "Post",
+            "data_testid": "reply",
+            "phase": "R",
+            "in_focal_article": True,
+        },
+        {
+            "text": "Schedule",
+            "data_testid": "reply",
+            "phase": "R",
+            "in_focal_article": True,
+        },
+        {
+            "text": "Save",
+            "data_testid": "reply",
+            "phase": "R",
+            "in_focal_article": True,
+        },
+        {
+            "text": "Delete",
+            "data_testid": "reply",
+            "phase": "R",
+            "in_focal_article": True,
+        },
+        {
+            "text": "Edit",
+            "data_testid": "reply",
+            "phase": "R",
+            "in_focal_article": True,
+        },
+    )
+    for kwargs in refused:
+        with pytest.raises(diagnose.UnsafeClickError):
+            diagnose.assert_safe_click(**kwargs)
+
+
+def test_format_reply_report_warns_when_cleanup_failed() -> None:
+    target = diagnose.StatusTarget(
+        tweet_id="111",
+        handle="olsa",
+        url="https://x.com/olsa/status/111",
+        path="/olsa/status/111",
+    )
+    report = diagnose.ReplyReport(
+        target=target,
+        artifacts=Path("/tmp/artifacts/reply"),
+        rows=(diagnose.DomRow("composer_root", "[role=dialog]", 1, False, phase_counts=(0, 1)),),
+        cleanup_ok=False,
+        dialog_closed=False,
+        close_path="failed",
+    )
+
+    text = "\n".join(diagnose.format_reply_report(report))
+
+    assert "REPLY CLEANUP FAILED" in text
+    assert "The composer is still open and may hold unsent text" in text
+    assert "Next: compare reply-composer.html" in text
+
+
+@pytest.mark.browser
+async def test_reply_report_modal_composer_captures_types_and_discards(
+    tmp_home: XPosterConfig, fake_x_factory: Any
+) -> None:
+    _skip_without_chrome(tmp_home)
+    fake = fake_x_factory(dom="legacy")
+    path = _reply_fixture(fake)
+    config = tmp_home.with_overrides(handle=fake.handle)
+
+    report = await diagnose.reply_report(
+        config,
+        SessionStore(config),
+        "111",
+        context_hook=_status_route_hook(fake, path, extra_body=_DECOY_REPLY_SCRIPT),
+        display=Display.HEADLESS,
+        wait_timeout_s=10.0,
+        wait_interval_s=0.1,
+        composer_timeout_s=5.0,
+        composer_poll_s=0.05,
+        networkidle_timeout_ms=0,
+        cleanup_timeout_s=1.0,
+        cleanup_poll_s=0.05,
+    )
+
+    rows = {row.name: row for row in report.rows}
+    assert report.rendered is True
+    assert report.composer_kind == "modal"
+    assert report.composer_found is True
+    assert report.note == ""
+    assert rows["tweet_article"].phase_counts[0] == 2  # decoy + focal
+    assert rows["composer_root"].phase_counts == (0, 1)
+    assert rows["composer_textarea_0"].phase_counts == (0, 1)
+    assert rows["composer_post_button"].phase_counts == (0, 1)
+    assert report.submit_control is not None
+    assert report.submit_control["data_testid"] == "tweetButtonInline"
+    assert report.submit_control["disabled"] is True
+    assert report.submit_enabled_after_typing is True
+    assert report.draftjs is True
+    assert any(button.data_testid == "tweetButtonInline" for button in report.composer_buttons)
+    assert any(
+        button.data_testid == "tweetButtonInline" and not button.disabled
+        for button in report.composer_buttons_after
+    )
+
+    assert report.composer_html is not None and report.composer_html.exists()
+    assert report.composer_html.name == "reply-composer.html"
+    assert report.composer_html.stat().st_mode & 0o777 == 0o600
+    assert "tweetTextarea_0" in report.composer_html.read_text(encoding="utf-8")
+    assert report.page_region_html is not None and report.page_region_html.exists()
+    assert report.page_region_html.name == "reply-page-region.html"
+    assert report.page_region_html.stat().st_mode & 0o777 == 0o600
+    assert "focal tweet" in report.page_region_html.read_text(encoding="utf-8")
+
+    names = [path.name for path in report.screenshots]
+    assert names == ["reply-a.png", "reply-b.png", "reply-c.png"]
+    for screenshot in report.screenshots:
+        assert screenshot.exists()
+        assert screenshot.stat().st_mode & 0o777 == 0o600
+
+    assert report.cleanup_ok is True
+    assert report.dialog_closed is True
+    assert report.close_path == "close"
+    assert report.discard_action == "discard"
+    assert any(button.text == "Discard" for button in report.discard_sheet)
+    assert report.inline_cleared is None
+
+    payload = json.loads(report.report_json.read_text(encoding="utf-8"))
+    assert report.report_json.stat().st_mode & 0o777 == 0o600
+    assert payload["phases"] == ["R", "R2"]
+    assert payload["composer_kind"] == "modal"
+    assert payload["composer_found"] is True
+    assert payload["submit_enabled_after_typing"] is True
+    assert payload["draftjs"] is True
+    assert payload["cleanup_ok"] is True
+    assert payload["dialog_closed"] is True
+    assert payload["draft_saved"] is False
+    assert payload["inline_cleared"] is None
+    assert payload["next_step"] == diagnose._REPLY_NEXT_STEP
+
+    text = "\n".join(diagnose.format_reply_report(report))
+    assert "composer=modal" in text
+    assert "R2" in text
+    assert "Reply composer HTML:" in text
+    assert "Artifacts:" in text
+    assert "Next: compare reply-composer.html" in text
+
+    assert len(fake.tweets) == 1
+    assert fake.tweets[0].id == "111"
+    assert fake.create_requests == []
+
+
+@pytest.mark.browser
+async def test_reply_report_inline_composer_clears_text_and_navigates_away(
+    tmp_home: XPosterConfig, fake_x_factory: Any
+) -> None:
+    _skip_without_chrome(tmp_home)
+    fake = fake_x_factory(dom="legacy")
+    path = _reply_fixture(fake)
+    config = tmp_home.with_overrides(handle=fake.handle)
+
+    report = await diagnose.reply_report(
+        config,
+        SessionStore(config),
+        "111",
+        context_hook=_status_route_hook(fake, path, extra_body=_INLINE_REPLY_SCRIPT),
+        display=Display.HEADLESS,
+        wait_timeout_s=10.0,
+        wait_interval_s=0.1,
+        composer_timeout_s=5.0,
+        composer_poll_s=0.05,
+        networkidle_timeout_ms=0,
+        cleanup_timeout_s=1.0,
+        cleanup_poll_s=0.05,
+    )
+
+    assert report.rendered is True
+    assert report.composer_kind == "inline"
+    assert report.composer_found is True
+    assert report.note == ""
+    assert report.submit_control is not None
+    assert report.submit_control["data_testid"] == "tweetButtonInline"
+    assert report.submit_enabled_after_typing is True
+    assert report.draftjs is True
+    assert report.inline_cleared is True
+    assert report.cleanup_ok is True
+    assert report.dialog_closed is True
+    assert report.close_path == "inline-clear"
+    assert report.discard_action == "cleared-and-navigated"
+
+    assert report.composer_html is not None
+    assert "fx-inline-reply" in report.composer_html.read_text(encoding="utf-8")
+    assert [path.name for path in report.screenshots] == [
+        "reply-a.png",
+        "reply-b.png",
+        "reply-c.png",
+    ]
+
+    payload = json.loads(report.report_json.read_text(encoding="utf-8"))
+    assert payload["composer_kind"] == "inline"
+    assert payload["inline_cleared"] is True
+    assert payload["cleanup_ok"] is True
+    assert payload["dialog_closed"] is True
+    assert payload["draft_saved"] is False
+
+    assert len(fake.tweets) == 1
+    assert fake.create_requests == []

@@ -400,6 +400,6 @@ def test_post_outcome_unknown_error_attributes() -> None:
 
 
 def test_public_exports() -> None:
-    assert xposter.__version__ == "0.1.0"
+    assert xposter.__version__ == "0.2.0"
     for name in xposter.__all__:
         assert hasattr(xposter, name), name
